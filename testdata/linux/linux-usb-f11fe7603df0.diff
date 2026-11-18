@@ -1,0 +1,2179 @@
+diff --git a/MAINTAINERS b/MAINTAINERS
+index ccbcdc0799b9fb..d738990161bd0f 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -7585,10 +7585,9 @@ F:	drivers/dma/dw-edma/
+ F:	include/linux/dma/edma.h
+ 
+ DESIGNWARE USB2 DRD IP DRIVER
+-M:	Minas Harutyunyan <hminas@synopsys.com>
++M:	Thinh Nguyen <Thinh.Nguyen@synopsys.com>
+ L:	linux-usb@vger.kernel.org
+ S:	Maintained
+-T:	git git://git.kernel.org/pub/scm/linux/kernel/git/balbi/usb.git
+ F:	drivers/usb/dwc2/
+ 
+ DESIGNWARE USB3 DRD IP DRIVER
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 4f9a57b77bfa28..c9e1987a69242d 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -683,6 +683,12 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ err_stop:
+ 	tb_ring_stop(sdev->rx_ring.ring);
+ 	tb_ring_stop(sdev->tx_ring.ring);
++	tb_xdomain_disable_paths(xd, sdev->out_hopid,
++				 sdev->tx_ring.ring->hop,
++				 sdev->in_hopid,
++				 sdev->rx_ring.ring->hop);
++	if (sdev->rx_ring.frames)
++		tbstream_ring_free(&sdev->rx_ring);
+ err_free_rx:
+ 	tb_ring_free(sdev->rx_ring.ring);
+ err_free_tx_buffers:
+diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
+index 489575d40bd148..666969ffd19449 100644
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -294,6 +294,7 @@ static void acm_process_notification(struct acm *acm, unsigned char *buf)
+ 	unsigned long flags;
+ 	struct usb_cdc_notification *dr = (struct usb_cdc_notification *)buf;
+ 	unsigned char *data = buf + sizeof(struct usb_cdc_notification);
++	struct tty_struct *tty;
+ 
+ 	switch (dr->bNotificationType) {
+ 	case USB_CDC_NOTIFY_NETWORK_CONNECTION:
+@@ -320,12 +321,17 @@ static void acm_process_notification(struct acm *acm, unsigned char *buf)
+ 
+ 		difference = acm->ctrlin ^ newctrl;
+ 
+-		if ((difference & USB_CDC_SERIAL_STATE_DCD) && acm->port.tty) {
+-			struct tty_ldisc *ld = tty_ldisc_ref(acm->port.tty);
+-			if (ld) {
+-				if (ld->ops->dcd_change)
+-					ld->ops->dcd_change(acm->port.tty, newctrl & USB_CDC_SERIAL_STATE_DCD);
+-				tty_ldisc_deref(ld);
++		if (difference & USB_CDC_SERIAL_STATE_DCD) {
++			tty = tty_port_tty_get(&acm->port);
++			if (tty) {
++				struct tty_ldisc *ld = tty_ldisc_ref(tty);
++
++				if (ld) {
++					if (ld->ops->dcd_change)
++						ld->ops->dcd_change(tty, newctrl & USB_CDC_SERIAL_STATE_DCD);
++					tty_ldisc_deref(ld);
++				}
++				tty_kref_put(tty);
+ 			}
+ 		}
+ 
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index f3dabb37f806b6..267c922ca11bb6 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -771,6 +771,7 @@ struct dwc3_ep {
+ #define DWC3_EP_TXFIFO_RESIZED		BIT(12)
+ #define DWC3_EP_DELAY_STOP             BIT(13)
+ #define DWC3_EP_RESOURCE_ALLOCATED	BIT(14)
++#define DWC3_EP_PENDING_NOOP_START	BIT(15)
+ 
+ 	/* This last one is specific to EP0 */
+ #define DWC3_EP0_DIR_IN			BIT(31)
+@@ -1695,7 +1696,8 @@ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned int cmd,
+ int dwc3_send_gadget_generic_command(struct dwc3 *dwc, unsigned int cmd,
+ 		u32 param);
+ void dwc3_gadget_clear_tx_fifos(struct dwc3 *dwc);
+-void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep, int status);
++void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep, int status,
++			  bool interrupt);
+ #else
+ static inline int dwc3_gadget_init(struct dwc3 *dwc)
+ { return 0; }
+diff --git a/drivers/usb/dwc3/dwc3-xilinx.c b/drivers/usb/dwc3/dwc3-xilinx.c
+index c9fb8c259493ef..095bc3dde0fa36 100644
+--- a/drivers/usb/dwc3/dwc3-xilinx.c
++++ b/drivers/usb/dwc3/dwc3-xilinx.c
+@@ -48,6 +48,9 @@ struct dwc3_xlnx {
+ 	void __iomem			*regs;
+ 	int				(*pltfm_init)(struct dwc3_xlnx *data);
+ 	struct phy			*usb3_phy;
++	struct reset_control		*usb_crst;
++	struct reset_control		*usb_hibrst;
++	struct reset_control		*usb_apbrst;
+ };
+ 
+ static void dwc3_xlnx_mask_phy_rst(struct dwc3_xlnx *priv_data, bool mask)
+@@ -109,10 +112,42 @@ static int dwc3_xlnx_init_versal(struct dwc3_xlnx *priv_data)
+ 	return 0;
+ }
+ 
++static void dwc3_xlnx_zynqmp_teardown(void *data)
++{
++	struct dwc3_xlnx *priv_data = data;
++
++	phy_power_off(priv_data->usb3_phy);
++
++	/*
++	 * Undo only the reset cycle init performed.  As on the init error
++	 * path, the unconditional deasserts are not paired with an assert
++	 * here: with no usb3-phy, resetting the core could break a USB3
++	 * configuration that is live but missing from the device tree.
++	 */
++	if (priv_data->usb3_phy) {
++		reset_control_assert(priv_data->usb_hibrst);
++		reset_control_assert(priv_data->usb_crst);
++		reset_control_assert(priv_data->usb_apbrst);
++	}
++
++	phy_exit(priv_data->usb3_phy);
++}
++
++/*
++ * Run the platform teardown explicitly, so the resets are asserted while the
++ * clocks are still running.  devm_release_action() unlinks the action before
++ * calling it, so devres will not run it a second time.
++ */
++static void dwc3_xlnx_release_teardown(struct device *dev,
++				       struct dwc3_xlnx *priv_data)
++{
++	if (devm_is_action_added(dev, dwc3_xlnx_zynqmp_teardown, priv_data))
++		devm_release_action(dev, dwc3_xlnx_zynqmp_teardown, priv_data);
++}
++
+ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
+ {
+ 	struct device		*dev = priv_data->dev;
+-	struct reset_control	*crst, *hibrst, *apbrst;
+ 	struct gpio_desc	*reset_gpio;
+ 	int			ret = 0;
+ 
+@@ -124,25 +159,25 @@ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
+ 		goto err;
+ 	}
+ 
+-	crst = devm_reset_control_get_exclusive(dev, "usb_crst");
+-	if (IS_ERR(crst)) {
+-		ret = PTR_ERR(crst);
++	priv_data->usb_crst = devm_reset_control_get_exclusive(dev, "usb_crst");
++	if (IS_ERR(priv_data->usb_crst)) {
++		ret = PTR_ERR(priv_data->usb_crst);
+ 		dev_err_probe(dev, ret,
+ 			      "failed to get core reset signal\n");
+ 		goto err;
+ 	}
+ 
+-	hibrst = devm_reset_control_get_exclusive(dev, "usb_hibrst");
+-	if (IS_ERR(hibrst)) {
+-		ret = PTR_ERR(hibrst);
++	priv_data->usb_hibrst = devm_reset_control_get_exclusive(dev, "usb_hibrst");
++	if (IS_ERR(priv_data->usb_hibrst)) {
++		ret = PTR_ERR(priv_data->usb_hibrst);
+ 		dev_err_probe(dev, ret,
+ 			      "failed to get hibernation reset signal\n");
+ 		goto err;
+ 	}
+ 
+-	apbrst = devm_reset_control_get_exclusive(dev, "usb_apbrst");
+-	if (IS_ERR(apbrst)) {
+-		ret = PTR_ERR(apbrst);
++	priv_data->usb_apbrst = devm_reset_control_get_exclusive(dev, "usb_apbrst");
++	if (IS_ERR(priv_data->usb_apbrst)) {
++		ret = PTR_ERR(priv_data->usb_apbrst);
+ 		dev_err_probe(dev, ret,
+ 			      "failed to get APB reset signal\n");
+ 		goto err;
+@@ -156,19 +191,19 @@ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
+ 	 * absent.
+ 	 */
+ 	if (priv_data->usb3_phy) {
+-		ret = reset_control_assert(crst);
++		ret = reset_control_assert(priv_data->usb_crst);
+ 		if (ret < 0) {
+ 			dev_err(dev, "Failed to assert core reset\n");
+ 			goto err;
+ 		}
+ 
+-		ret = reset_control_assert(hibrst);
++		ret = reset_control_assert(priv_data->usb_hibrst);
+ 		if (ret < 0) {
+ 			dev_err(dev, "Failed to assert hibernation reset\n");
+ 			goto err;
+ 		}
+ 
+-		ret = reset_control_assert(apbrst);
++		ret = reset_control_assert(priv_data->usb_apbrst);
+ 		if (ret < 0) {
+ 			dev_err(dev, "Failed to assert APB reset\n");
+ 			goto err;
+@@ -179,7 +214,7 @@ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
+ 	if (ret < 0)
+ 		goto err;
+ 
+-	ret = reset_control_deassert(apbrst);
++	ret = reset_control_deassert(priv_data->usb_apbrst);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Failed to release APB reset\n");
+ 		goto err_phy_exit;
+@@ -195,21 +230,21 @@ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
+ 		writel(PIPE_CLK_DESELECT, priv_data->regs + XLNX_USB_FPD_PIPE_CLK);
+ 	}
+ 
+-	ret = reset_control_deassert(crst);
++	ret = reset_control_deassert(priv_data->usb_crst);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Failed to release core reset\n");
+-		goto err_phy_exit;
++		goto err_reset_assert;
+ 	}
+ 
+-	ret = reset_control_deassert(hibrst);
++	ret = reset_control_deassert(priv_data->usb_hibrst);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Failed to release hibernation reset\n");
+-		goto err_phy_exit;
++		goto err_reset_assert;
+ 	}
+ 
+ 	ret = phy_power_on(priv_data->usb3_phy);
+ 	if (ret < 0)
+-		goto err_phy_exit;
++		goto err_reset_assert;
+ 
+ 	/* ulpi reset via gpio-modepin or gpio-framework driver */
+ 	reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+@@ -226,10 +261,26 @@ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
+ 
+ 	dwc3_xlnx_set_coherency(priv_data, XLNX_USB_TRAFFIC_ROUTE_CONFIG);
+ 
+-	return 0;
++	return devm_add_action_or_reset(dev, dwc3_xlnx_zynqmp_teardown,
++					priv_data);
+ 
+ err_phy_power_off:
+ 	phy_power_off(priv_data->usb3_phy);
++err_reset_assert:
++	/*
++	 * Undo only the reset cycle performed above.  That cycle is skipped
++	 * when there is no usb3-phy.  The deasserts stay unconditional so a
++	 * core the bootloader left in reset still comes up, but they are
++	 * deliberately not paired with an assert here: resetting a USB3
++	 * configuration that is live but missing from the device tree could
++	 * break it.  Asserting an already asserted reset is harmless, so one
++	 * block covers however far the cycle's deasserts got.
++	 */
++	if (priv_data->usb3_phy) {
++		reset_control_assert(priv_data->usb_hibrst);
++		reset_control_assert(priv_data->usb_crst);
++		reset_control_assert(priv_data->usb_apbrst);
++	}
+ err_phy_exit:
+ 	phy_exit(priv_data->usb3_phy);
+ err:
+@@ -338,6 +389,7 @@ static int dwc3_xlnx_probe(struct platform_device *pdev)
+ 	pm_runtime_set_suspended(dev);
+ 
+ err_clk_put:
++	dwc3_xlnx_release_teardown(dev, priv_data);
+ 	clk_bulk_disable_unprepare(priv_data->num_clocks, priv_data->clks);
+ 
+ 	return ret;
+@@ -350,6 +402,13 @@ static void dwc3_xlnx_remove(struct platform_device *pdev)
+ 
+ 	of_platform_depopulate(dev);
+ 
++	/*
++	 * This is also what makes .shutdown behave the same as .remove:
++	 * device_shutdown() does not call devres_release_all(), so a teardown
++	 * left to devres would never run on the shutdown path.
++	 */
++	dwc3_xlnx_release_teardown(dev, priv_data);
++
+ 	clk_bulk_disable_unprepare(priv_data->num_clocks, priv_data->clks);
+ 	priv_data->num_clocks = 0;
+ 
+@@ -383,13 +442,26 @@ static int __maybe_unused dwc3_xlnx_runtime_idle(struct device *dev)
+ static int __maybe_unused dwc3_xlnx_suspend(struct device *dev)
+ {
+ 	struct dwc3_xlnx *priv_data = dev_get_drvdata(dev);
++	int ret;
+ 
+-	phy_exit(priv_data->usb3_phy);
++	ret = phy_power_off(priv_data->usb3_phy);
++	if (ret < 0)
++		return ret;
++
++	ret = phy_exit(priv_data->usb3_phy);
++	if (ret < 0)
++		goto err_phy_power_on;
+ 
+ 	/* Disable the clocks */
+ 	clk_bulk_disable(priv_data->num_clocks, priv_data->clks);
+ 
+ 	return 0;
++
++err_phy_power_on:
++	if (phy_power_on(priv_data->usb3_phy))
++		dev_err(dev, "failed to restore PHY power after suspend error\n");
++
++	return ret;
+ }
+ 
+ static int __maybe_unused dwc3_xlnx_resume(struct device *dev)
+@@ -403,15 +475,20 @@ static int __maybe_unused dwc3_xlnx_resume(struct device *dev)
+ 
+ 	ret = phy_init(priv_data->usb3_phy);
+ 	if (ret < 0)
+-		return ret;
++		goto err_clk_disable;
+ 
+ 	ret = phy_power_on(priv_data->usb3_phy);
+ 	if (ret < 0) {
+ 		phy_exit(priv_data->usb3_phy);
+-		return ret;
++		goto err_clk_disable;
+ 	}
+ 
+ 	return 0;
++
++err_clk_disable:
++	clk_bulk_disable(priv_data->num_clocks, priv_data->clks);
++
++	return ret;
+ }
+ 
+ static const struct dev_pm_ops dwc3_xlnx_dev_pm_ops = {
+diff --git a/drivers/usb/dwc3/ep0.c b/drivers/usb/dwc3/ep0.c
+index 46a34c4a046b40..cf5a47b71efc81 100644
+--- a/drivers/usb/dwc3/ep0.c
++++ b/drivers/usb/dwc3/ep0.c
+@@ -315,7 +315,7 @@ void dwc3_ep0_out_start(struct dwc3 *dwc)
+ 		if (dwc->connected)
+ 			dwc3_stop_active_transfer(dwc3_ep, false, true);
+ 		else
+-			dwc3_remove_requests(dwc, dwc3_ep, -ESHUTDOWN);
++			dwc3_remove_requests(dwc, dwc3_ep, -ESHUTDOWN, false);
+ 	}
+ }
+ 
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index ee837235630ad9..a76f669a796c2e 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -906,6 +906,54 @@ static int dwc3_gadget_resize_tx_fifos(struct dwc3_ep *dep)
+ 	return 0;
+ }
+ 
++static int dwc3_gadget_ep_start_noop_transfer(struct dwc3_ep *dep)
++{
++	struct dwc3_gadget_ep_cmd_params params;
++	struct dwc3		*dwc = dep->dwc;
++	struct dwc3_trb		*trb;
++	dma_addr_t		trb_dma;
++	u32			cmd;
++	int			ret;
++
++	memset(&params, 0, sizeof(params));
++	trb = &dep->trb_pool[0];
++	trb_dma = dwc3_trb_dma_offset(dep, trb);
++
++	params.param0 = upper_32_bits(trb_dma);
++	params.param1 = lower_32_bits(trb_dma);
++
++	cmd = DWC3_DEPCMD_STARTTRANSFER;
++
++	ret = dwc3_send_gadget_ep_cmd(dep, cmd, &params);
++	if (ret < 0)
++		return ret;
++
++	/*
++	 * For streams, at start, there maybe a race where the host primes the
++	 * endpoint before the function driver queues a request to initiate a
++	 * stream. In that case, the controller will not see the prime to
++	 * generate the ERDY and start stream. To workaround this, issue a
++	 * no-op TRB as normal, but end it immediately. As a result, when the
++	 * function driver queues the request, the next START_TRANSFER command
++	 * will cause the controller to generate an ERDY to initiate the
++	 * stream.
++	 */
++	dwc3_stop_active_transfer(dep, false, true);
++
++	/*
++	 * All stream eps will reinitiate stream on NoStream rejection.
++	 *
++	 * However, if the controller is capable of TXF_FLUSH_BYPASS, then IN
++	 * direction endpoints will automatically restart the stream without
++	 * the driver initiation.
++	 */
++	if (!dep->direction ||
++	    !(dwc->hwparams.hwparams9 & DWC3_GHWPARAMS9_DEV_TXF_FLUSH_BYPASS))
++		dep->flags |= DWC3_EP_FORCE_RESTART_STREAM;
++
++	return 0;
++}
++
+ /**
+  * __dwc3_gadget_ep_enable - initializes a hw endpoint
+  * @dep: endpoint to be initialized
+@@ -971,54 +1019,14 @@ static int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action)
+ 	 * Issue StartTransfer here with no-op TRB so we can always rely on No
+ 	 * Response Update Transfer command.
+ 	 */
+-	if (usb_endpoint_xfer_bulk(desc) ||
+-			usb_endpoint_xfer_int(desc)) {
+-		struct dwc3_gadget_ep_cmd_params params;
+-		struct dwc3_trb	*trb;
+-		dma_addr_t trb_dma;
+-		u32 cmd;
+-
+-		memset(&params, 0, sizeof(params));
+-		trb = &dep->trb_pool[0];
+-		trb_dma = dwc3_trb_dma_offset(dep, trb);
+-
+-		params.param0 = upper_32_bits(trb_dma);
+-		params.param1 = lower_32_bits(trb_dma);
+-
+-		cmd = DWC3_DEPCMD_STARTTRANSFER;
+-
+-		ret = dwc3_send_gadget_ep_cmd(dep, cmd, &params);
+-		if (ret < 0)
+-			return ret;
+-
+-		if (dep->stream_capable) {
+-			/*
+-			 * For streams, at start, there maybe a race where the
+-			 * host primes the endpoint before the function driver
+-			 * queues a request to initiate a stream. In that case,
+-			 * the controller will not see the prime to generate the
+-			 * ERDY and start stream. To workaround this, issue a
+-			 * no-op TRB as normal, but end it immediately. As a
+-			 * result, when the function driver queues the request,
+-			 * the next START_TRANSFER command will cause the
+-			 * controller to generate an ERDY to initiate the
+-			 * stream.
+-			 */
+-			dwc3_stop_active_transfer(dep, false, true);
+-
+-			/*
+-			 * All stream eps will reinitiate stream on NoStream
+-			 * rejection.
+-			 *
+-			 * However, if the controller is capable of
+-			 * TXF_FLUSH_BYPASS, then IN direction endpoints will
+-			 * automatically restart the stream without the driver
+-			 * initiation.
+-			 */
+-			if (!dep->direction ||
+-			    !(dwc->hwparams.hwparams9 &
+-			      DWC3_GHWPARAMS9_DEV_TXF_FLUSH_BYPASS))
+-				dep->flags |= DWC3_EP_FORCE_RESTART_STREAM;
++	if (dep->stream_capable) {
++		if (dep->flags & (DWC3_EP_END_TRANSFER_PENDING |
++				  DWC3_EP_DELAY_STOP)) {
++			dep->flags |= DWC3_EP_PENDING_NOOP_START;
++		} else {
++			ret = dwc3_gadget_ep_start_noop_transfer(dep);
++			if (ret < 0)
++				return ret;
+ 		}
+ 	}
+ 
+@@ -1028,16 +1036,21 @@ static int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action)
+ 	return 0;
+ }
+ 
+-void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep, int status)
++void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep, int status,
++			  bool interrupt)
+ {
+ 	struct dwc3_request		*req;
+ 
+-	dwc3_stop_active_transfer(dep, false, false);
++	dwc3_stop_active_transfer(dep, false, interrupt);
+ 
+ 	/* If endxfer is delayed, avoid unmapping requests */
+ 	if (dep->flags & DWC3_EP_DELAY_STOP)
+ 		return;
+ 
++	/* Give the controller time to stop accessing the request buffers */
++	if (dep->flags & DWC3_EP_END_TRANSFER_PENDING)
++		mdelay(1);
++
+ 	/* - giveback all requests to gadget driver */
+ 	while (!list_empty(&dep->started_list)) {
+ 		req = next_request(&dep->started_list);
+@@ -1084,7 +1097,9 @@ static int __dwc3_gadget_ep_disable(struct dwc3_ep *dep)
+ 	reg &= ~DWC3_DALEPENA_EP(dep->number);
+ 	dwc3_writel(dwc, DWC3_DALEPENA, reg);
+ 
+-	dwc3_remove_requests(dwc, dep, -ESHUTDOWN);
++	dep->flags &= ~DWC3_EP_ENABLED;
++
++	dwc3_remove_requests(dwc, dep, -ESHUTDOWN, true);
+ 
+ 	dep->stream_capable = false;
+ 	dep->type = 0;
+@@ -1096,6 +1111,15 @@ static int __dwc3_gadget_ep_disable(struct dwc3_ep *dep)
+ 	 */
+ 	if (dep->flags & DWC3_EP_DELAY_STOP)
+ 		mask |= (DWC3_EP_DELAY_STOP | DWC3_EP_TRANSFER_STARTED);
++
++	/*
++	 * The End Transfer command is still in progress.  Do not clear the
++	 * flags, so that the ep is only rearmed once the command completes.
++	 */
++	if (dep->flags & DWC3_EP_END_TRANSFER_PENDING)
++		mask |= (DWC3_EP_END_TRANSFER_PENDING |
++			 DWC3_EP_TRANSFER_STARTED);
++
+ 	dep->flags &= mask;
+ 
+ 	/* Clear out the ep descriptors for non-ep0 */
+@@ -1751,6 +1775,8 @@ static int __dwc3_gadget_get_frame(struct dwc3 *dwc)
+ 	return DWC3_DSTS_SOFFN(reg);
+ }
+ 
++static void dwc3_schedule_err_recovery(struct dwc3 *dwc);
++
+ /**
+  * __dwc3_stop_active_transfer - stop the current active transfer
+  * @dep: isoc endpoint
+@@ -1794,11 +1820,14 @@ static int __dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force, bool int
+ 		dev_err_ratelimited(dep->dwc->dev,
+ 				"end transfer failed: %d\n", ret);
+ 
++	if (ret == -ETIMEDOUT && dep->dwc->err_state == DWC3_ERR_NONE)
++		dwc3_schedule_err_recovery(dep->dwc);
++
+ 	dep->resource_index = 0;
+ 
+-	if (!interrupt)
++	if (!interrupt || (ret && ret != -ETIMEDOUT))
+ 		dep->flags &= ~DWC3_EP_TRANSFER_STARTED;
+-	else if (!ret)
++	else
+ 		dep->flags |= DWC3_EP_END_TRANSFER_PENDING;
+ 
+ 	dep->flags &= ~DWC3_EP_DELAY_STOP;
+@@ -1990,7 +2019,8 @@ static int __dwc3_gadget_ep_queue(struct dwc3_ep *dep, struct dwc3_request *req)
+ {
+ 	struct dwc3		*dwc = dep->dwc;
+ 
+-	if (!dep->endpoint.desc || !dwc->pullups_connected || !dwc->connected) {
++	if (!(dep->flags & DWC3_EP_ENABLED) || !dep->endpoint.desc ||
++	    !dwc->pullups_connected || !dwc->connected) {
+ 		dev_dbg(dwc->dev, "%s: can't queue to disabled endpoint\n",
+ 				dep->name);
+ 		return -ESHUTDOWN;
+@@ -2547,7 +2577,7 @@ static void dwc3_stop_active_transfers(struct dwc3 *dwc)
+ 		if (!dep)
+ 			continue;
+ 
+-		dwc3_remove_requests(dwc, dep, -ESHUTDOWN);
++		dwc3_remove_requests(dwc, dep, -ESHUTDOWN, false);
+ 	}
+ }
+ 
+@@ -2947,6 +2977,7 @@ static int __dwc3_gadget_start(struct dwc3 *dwc)
+ {
+ 	struct dwc3_ep		*dep;
+ 	int			ret = 0;
++	u32			epnum;
+ 	u32			reg;
+ 
+ 	/*
+@@ -3004,6 +3035,15 @@ static int __dwc3_gadget_start(struct dwc3 *dwc)
+ 		return ret;
+ 	}
+ 
++	for (epnum = 2; epnum < dwc->num_eps; epnum++) {
++		dep = dwc->eps[epnum];
++		if (!dep)
++			continue;
++
++		dep->flags &= (DWC3_EP_TXFIFO_RESIZED |
++			       DWC3_EP_RESOURCE_ALLOCATED);
++	}
++
+ 	dep = dwc->eps[0];
+ 	dep->flags = 0;
+ 	ret = __dwc3_gadget_ep_enable(dep, DWC3_DEPCFG_ACTION_INIT);
+@@ -3872,6 +3912,7 @@ static void dwc3_gadget_endpoint_command_complete(struct dwc3_ep *dep,
+ 	if (dep->stream_capable)
+ 		dep->flags |= DWC3_EP_IGNORE_NEXT_NOSTREAM;
+ 
++	dep->flags &= ~DWC3_EP_DELAY_STOP;
+ 	dep->flags &= ~DWC3_EP_END_TRANSFER_PENDING;
+ 	dep->flags &= ~DWC3_EP_TRANSFER_STARTED;
+ 	dwc3_gadget_ep_cleanup_cancelled_requests(dep);
+@@ -3894,7 +3935,16 @@ static void dwc3_gadget_endpoint_command_complete(struct dwc3_ep *dep,
+ 			dwc3_ep0_send_delayed_status(dwc);
+ 	}
+ 
++	if (dep->flags & DWC3_EP_PENDING_NOOP_START) {
++		dep->flags &= ~DWC3_EP_PENDING_NOOP_START;
++
++		if (!(dep->flags & DWC3_EP_DELAY_START) &&
++		    (dep->flags & DWC3_EP_ENABLED))
++			dwc3_gadget_ep_start_noop_transfer(dep);
++	}
++
+ 	if ((dep->flags & DWC3_EP_DELAY_START) &&
++	    (dep->flags & DWC3_EP_ENABLED) &&
+ 	    !usb_endpoint_xfer_isoc(dep->endpoint.desc))
+ 		__dwc3_gadget_kick_transfer(dep);
+ 
+diff --git a/drivers/usb/dwc3/trace.h b/drivers/usb/dwc3/trace.h
+index 5253da23d8b003..0caaa0b396d1c4 100644
+--- a/drivers/usb/dwc3/trace.h
++++ b/drivers/usb/dwc3/trace.h
+@@ -141,6 +141,7 @@ DECLARE_EVENT_CLASS(dwc3_log_request,
+ 	),
+ 	TP_fast_assign(
+ 		__entry->base_address = req->dep->dwc->xhci_resources[0].start;
++		__assign_str(name);
+ 		__entry->req = req;
+ 		__entry->actual = req->request.actual;
+ 		__entry->length = req->request.length;
+diff --git a/drivers/usb/gadget/function/f_mass_storage.c b/drivers/usb/gadget/function/f_mass_storage.c
+index e3c9b7ab9f39ba..52314a00d8e64f 100644
+--- a/drivers/usb/gadget/function/f_mass_storage.c
++++ b/drivers/usb/gadget/function/f_mass_storage.c
+@@ -2669,8 +2669,9 @@ static ssize_t nofua_store(struct device *dev, struct device_attribute *attr,
+ 			   const char *buf, size_t count)
+ {
+ 	struct fsg_lun		*curlun = fsg_lun_from_dev(dev);
++	struct rw_semaphore	*filesem = dev_get_drvdata(dev);
+ 
+-	return fsg_store_nofua(curlun, buf, count);
++	return fsg_store_nofua(curlun, filesem, buf, count);
+ }
+ 
+ static ssize_t file_store(struct device *dev, struct device_attribute *attr,
+@@ -3248,7 +3249,10 @@ static ssize_t fsg_lun_opts_nofua_show(struct config_item *item, char *page)
+ static ssize_t fsg_lun_opts_nofua_store(struct config_item *item,
+ 				       const char *page, size_t len)
+ {
+-	return fsg_store_nofua(to_fsg_lun_opts(item)->lun, page, len);
++	struct fsg_lun_opts *opts = to_fsg_lun_opts(item);
++	struct fsg_opts *fsg_opts = to_fsg_opts(opts->group.cg_item.ci_parent);
++
++	return fsg_store_nofua(opts->lun, &fsg_opts->common->filesem, page, len);
+ }
+ 
+ CONFIGFS_ATTR(fsg_lun_opts_, nofua);
+diff --git a/drivers/usb/gadget/function/f_midi.c b/drivers/usb/gadget/function/f_midi.c
+index 63fb6ee70a3d65..48cda34399e818 100644
+--- a/drivers/usb/gadget/function/f_midi.c
++++ b/drivers/usb/gadget/function/f_midi.c
+@@ -420,6 +420,7 @@ static void f_midi_disable(struct usb_function *f)
+ 	struct f_midi *midi = func_to_midi(f);
+ 	struct usb_composite_dev *cdev = f->config->cdev;
+ 	struct usb_request *req = NULL;
++	unsigned long flags;
+ 
+ 	DBG(cdev, "disable\n");
+ 
+@@ -431,8 +432,10 @@ static void f_midi_disable(struct usb_function *f)
+ 	usb_ep_disable(midi->out_ep);
+ 
+ 	/* release IN requests */
++	spin_lock_irqsave(&midi->transmit_lock, flags);
+ 	while (kfifo_get(&midi->in_req_fifo, &req))
+ 		free_ep_req(midi->in_ep, req);
++	spin_unlock_irqrestore(&midi->transmit_lock, flags);
+ 
+ 	f_midi_drop_out_substreams(midi);
+ }
+@@ -661,6 +664,7 @@ static int f_midi_do_transmit(struct f_midi *midi, struct usb_ep *ep)
+ 		ERROR(midi, "%s failed to queue req: %d\n",
+ 		      midi->in_ep->name, err);
+ 		req->length = 0; /* Re-use request next time. */
++		return err;
+ 	} else {
+ 		/* Upon success, put request at the back of the queue. */
+ 		kfifo_skip(&midi->in_req_fifo);
+diff --git a/drivers/usb/gadget/function/f_ncm.c b/drivers/usb/gadget/function/f_ncm.c
+index 7f4324981eb31a..7e945668f01703 100644
+--- a/drivers/usb/gadget/function/f_ncm.c
++++ b/drivers/usb/gadget/function/f_ncm.c
+@@ -1148,6 +1148,7 @@ static enum hrtimer_restart ncm_tx_timeout(struct hrtimer *data)
+ {
+ 	struct f_ncm *ncm = container_of(data, struct f_ncm, task_timer);
+ 	struct net_device *netdev = READ_ONCE(ncm->netdev);
++	netdev_tx_t ret;
+ 
+ 	if (netdev) {
+ 		/* XXX This allowance of a NULL skb argument to ndo_start_xmit
+@@ -1158,7 +1159,11 @@ static enum hrtimer_restart ncm_tx_timeout(struct hrtimer *data)
+ 		 *
+ 		 * This will call directly into u_ether's eth_start_xmit()
+ 		 */
+-		netdev->netdev_ops->ndo_start_xmit(NULL, netdev);
++		ret = netdev->netdev_ops->ndo_start_xmit(NULL, netdev);
++		if (ret == NETDEV_TX_BUSY) {
++			hrtimer_forward_now(data, TX_TIMEOUT_NSECS);
++			return HRTIMER_RESTART;
++		}
+ 	}
+ 	return HRTIMER_NORESTART;
+ }
+diff --git a/drivers/usb/gadget/function/storage_common.c b/drivers/usb/gadget/function/storage_common.c
+index 75831f2c7abeb0..51a70f2abe574a 100644
+--- a/drivers/usb/gadget/function/storage_common.c
++++ b/drivers/usb/gadget/function/storage_common.c
+@@ -415,7 +415,8 @@ ssize_t fsg_store_ro(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+ }
+ EXPORT_SYMBOL_GPL(fsg_store_ro);
+ 
+-ssize_t fsg_store_nofua(struct fsg_lun *curlun, const char *buf, size_t count)
++ssize_t fsg_store_nofua(struct fsg_lun *curlun, struct rw_semaphore *filesem,
++			const char *buf, size_t count)
+ {
+ 	bool		nofua;
+ 	int		ret;
+@@ -425,8 +426,10 @@ ssize_t fsg_store_nofua(struct fsg_lun *curlun, const char *buf, size_t count)
+ 		return ret;
+ 
+ 	/* Sync data when switching from async mode to sync */
+-	if (!nofua && curlun->nofua)
++	if (!nofua && curlun->nofua) {
++		guard(rwsem_read)(filesem);
+ 		fsg_lun_fsync_sub(curlun);
++	}
+ 
+ 	curlun->nofua = nofua;
+ 
+diff --git a/drivers/usb/gadget/function/storage_common.h b/drivers/usb/gadget/function/storage_common.h
+index e73a30cc553fc4..e66b753d7cbd98 100644
+--- a/drivers/usb/gadget/function/storage_common.h
++++ b/drivers/usb/gadget/function/storage_common.h
+@@ -245,7 +245,8 @@ ssize_t fsg_show_cdrom(struct fsg_lun *curlun, char *buf);
+ ssize_t fsg_show_removable(struct fsg_lun *curlun, char *buf);
+ ssize_t fsg_store_ro(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+ 		     const char *buf, size_t count);
+-ssize_t fsg_store_nofua(struct fsg_lun *curlun, const char *buf, size_t count);
++ssize_t fsg_store_nofua(struct fsg_lun *curlun, struct rw_semaphore *filesem,
++			const char *buf, size_t count);
+ ssize_t fsg_store_file(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+ 		       const char *buf, size_t count);
+ ssize_t fsg_store_cdrom(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+diff --git a/drivers/usb/gadget/function/u_serial.c b/drivers/usb/gadget/function/u_serial.c
+index cdd1dfc666c4f6..0a304f508bc384 100644
+--- a/drivers/usb/gadget/function/u_serial.c
++++ b/drivers/usb/gadget/function/u_serial.c
+@@ -70,10 +70,28 @@
+  *	gserial->ioport == usb_ep->driver_data ... gs_port
+  *	gs_port->port_usb ... gserial
+  *
+- * gs_port <---> tty_struct ... links will be null when the TTY file
+- * isn't opened; managed by gs_open()/gs_close()
+- *	gserial->port_tty ... tty_struct
+- *	tty_struct->driver_data ... gserial
++ * gs_port <---> tty_struct:
++ *	tty->driver_data refers to gs_port from install through cleanup,
++ *	pinning the port via tty_port reference counting.
++ *	gs_port->port.tty exists only while the port is open.
++ *
++ * Each entry in ports[] is guarded by ports[i].lock and models three states:
++ *   - Free:      !port && !reserved
++ *   - Published:  port &&  reserved
++ *   - Retiring:   !port &&  reserved
++ *
++ * A minor remains reserved until gs_port_destruct() runs upon final tty_port
++ * release, preventing minor reuse while cleanup of the installed TTY is still
++ * underway. The owner reference is retained through device unregister so the
++ * destructor releases the reservation only after device teardown is complete.
++ *
++ * open_close_failures tracks failed gs_open() calls where port->port.count
++ * was not incremented. The TTY core calls gs_close() on open failure to tear
++ * down the tty; tracking failures as aggregate credits allows gs_close() to
++ * consume a credit and exit without decrementing port->port.count. Credits
++ * are aggregate rather than paired with individual files (another gs_close()
++ * can consume a failed open's credit before that file's own close runs).
++ * It is protected by tty_lock.
+  */
+ 
+ /* RX and TX queues can buffer QUEUE_SIZE packets before they hit the
+@@ -128,6 +146,7 @@ struct gs_port {
+ 	wait_queue_head_t	close_wait;
+ 	bool			suspended;	/* port suspended */
+ 	bool			start_delayed;	/* delay start when suspended */
++	unsigned int		open_close_failures; /* protected by tty_lock */
+ 	struct async_icount	icount;
+ 
+ 	/* REVISIT this state ... */
+@@ -135,8 +154,9 @@ struct gs_port {
+ };
+ 
+ static struct portmaster {
+-	struct mutex	lock;			/* protect open/close */
++	struct mutex	lock;			/* protect open/close and port slot */
+ 	struct gs_port	*port;
++	bool		reserved;
+ } ports[MAX_U_SERIAL_PORTS];
+ 
+ #define GS_CLOSE_TIMEOUT		15		/* seconds */
+@@ -603,22 +623,60 @@ static int gserial_wakeup_host(struct gserial *gser)
+ 
+ /* TTY Driver */
+ 
++static int gs_install(struct tty_driver *driver, struct tty_struct *tty)
++{
++	struct gs_port *port;
++	struct tty_port *tport;
++	int ret;
++
++	mutex_lock(&ports[tty->index].lock);
++	port = ports[tty->index].port;
++	if (!port) {
++		mutex_unlock(&ports[tty->index].lock);
++		return -ENODEV;
++	}
++
++	tport = tty_port_get(&port->port);
++	if (!tport) {
++		mutex_unlock(&ports[tty->index].lock);
++		return -ENODEV;
++	}
++
++	ret = tty_port_install(tport, driver, tty);
++	if (ret) {
++		mutex_unlock(&ports[tty->index].lock);
++		tty_port_put(tport);
++		return ret;
++	}
++
++	tty->driver_data = port;
++	mutex_unlock(&ports[tty->index].lock);
++
++	return 0;
++}
++
++static void gs_cleanup(struct tty_struct *tty)
++{
++	tty_port_put(tty->port);
++}
++
+ /*
+- * gs_open sets up the link between a gs_port and its associated TTY.
+- * That link is broken *only* by TTY close(), and all driver methods
+- * know that.
++ * gs_open associates an open TTY with its gs_port.
++ *
++ * There are two TTY-to-port relationships: port->port.tty exists from the
++ * first successful open until final close, while tty->driver_data is assigned
++ * during gs_install() and remains valid through gs_cleanup().
+  */
+ static int gs_open(struct tty_struct *tty, struct file *file)
+ {
+ 	int		port_num = tty->index;
+-	struct gs_port	*port;
++	struct gs_port	*port = tty->driver_data;
+ 	int		status = 0;
+ 
+ 	mutex_lock(&ports[port_num].lock);
+-	port = ports[port_num].port;
+-	if (!port) {
++	if (ports[port_num].port != port) {
+ 		status = -ENODEV;
+-		goto out;
++		goto fail_unlock;
+ 	}
+ 
+ 	spin_lock_irq(&port->port_lock);
+@@ -638,7 +696,7 @@ static int gs_open(struct tty_struct *tty, struct file *file)
+ 		if (status) {
+ 			pr_debug("gs_open: ttyGS%d (%p,%p) no buffer\n",
+ 				 port_num, tty, file);
+-			goto out;
++			goto fail_unlock;
+ 		}
+ 
+ 		spin_lock_irq(&port->port_lock);
+@@ -648,7 +706,6 @@ static int gs_open(struct tty_struct *tty, struct file *file)
+ 	if (port->port.count++)
+ 		goto exit_unlock_port;
+ 
+-	tty->driver_data = port;
+ 	port->port.tty = tty;
+ 
+ 	/* if connected, start the I/O stream */
+@@ -672,7 +729,11 @@ static int gs_open(struct tty_struct *tty, struct file *file)
+ 
+ exit_unlock_port:
+ 	spin_unlock_irq(&port->port_lock);
+-out:
++	mutex_unlock(&ports[port_num].lock);
++	return status;
++
++fail_unlock:
++	port->open_close_failures++;
+ 	mutex_unlock(&ports[port_num].lock);
+ 	return status;
+ }
+@@ -695,6 +756,14 @@ static void gs_close(struct tty_struct *tty, struct file *file)
+ 	struct gs_port *port = tty->driver_data;
+ 	struct gserial	*gser;
+ 
++	if (!port)
++		return;
++
++	if (port->open_close_failures > 0) {
++		port->open_close_failures--;
++		return;
++	}
++
+ 	spin_lock_irq(&port->port_lock);
+ 
+ 	if (port->port.count != 1) {
+@@ -909,8 +978,10 @@ static int gs_get_icount(struct tty_struct *tty,
+ }
+ 
+ static const struct tty_operations gs_tty_ops = {
++	.install =		gs_install,
+ 	.open =			gs_open,
+ 	.close =		gs_close,
++	.cleanup =		gs_cleanup,
+ 	.write =		gs_write,
+ 	.put_char =		gs_put_char,
+ 	.flush_chars =		gs_flush_chars,
+@@ -1203,14 +1274,41 @@ static void gs_console_exit(struct gs_port *port)
+ 
+ #endif
+ 
+-static int
++static void gs_port_destruct(struct tty_port *tport)
++{
++	struct gs_port *port = container_of(tport, struct gs_port, port);
++	unsigned int port_num = port->port_num;
++
++	mutex_lock(&ports[port_num].lock);
++	if (WARN_ON(ports[port_num].port))
++		ports[port_num].port = NULL;
++	WARN_ON(!ports[port_num].reserved);
++	if (gs_tty_driver)
++		gs_tty_driver->ports[port_num] = NULL;
++	ports[port_num].reserved = false;
++	mutex_unlock(&ports[port_num].lock);
++
++	kfifo_free(&port->port_write_buf);
++	kfree(port);
++}
++
++static const struct tty_port_operations gs_port_ops = {
++	.destruct = gs_port_destruct,
++};
++
++static struct gs_port *
+ gs_port_alloc(unsigned port_num, struct usb_cdc_line_coding *coding)
+ {
+ 	struct gs_port	*port;
+ 	int		ret = 0;
+ 
+ 	mutex_lock(&ports[port_num].lock);
+-	if (ports[port_num].port) {
++	if (WARN_ON_ONCE(ports[port_num].port && !ports[port_num].reserved)) {
++		ret = -EBUSY;
++		goto out;
++	}
++
++	if (ports[port_num].reserved) {
+ 		ret = -EBUSY;
+ 		goto out;
+ 	}
+@@ -1222,6 +1320,7 @@ gs_port_alloc(unsigned port_num, struct usb_cdc_line_coding *coding)
+ 	}
+ 
+ 	tty_port_init(&port->port);
++	port->port.ops = &gs_port_ops;
+ 	spin_lock_init(&port->port_lock);
+ 	init_waitqueue_head(&port->drain_wait);
+ 	init_waitqueue_head(&port->close_wait);
+@@ -1235,10 +1334,14 @@ gs_port_alloc(unsigned port_num, struct usb_cdc_line_coding *coding)
+ 	port->port_num = port_num;
+ 	port->port_line_coding = *coding;
+ 
++	ports[port_num].reserved = true;
+ 	ports[port_num].port = port;
++	mutex_unlock(&ports[port_num].lock);
++	return port;
++
+ out:
+ 	mutex_unlock(&ports[port_num].lock);
+-	return ret;
++	return ERR_PTR(ret);
+ }
+ 
+ static int gs_closed(struct gs_port *port)
+@@ -1258,8 +1361,7 @@ static void gserial_free_port(struct gs_port *port)
+ 	/* wait for old opens to finish */
+ 	wait_event(port->close_wait, gs_closed(port));
+ 	WARN_ON(port->port_usb != NULL);
+-	tty_port_destroy(&port->port);
+-	kfree(port);
++	tty_port_put(&port->port);
+ }
+ 
+ void gserial_free_line(unsigned char port_num)
+@@ -1276,15 +1378,15 @@ void gserial_free_line(unsigned char port_num)
+ 	ports[port_num].port = NULL;
+ 	mutex_unlock(&ports[port_num].lock);
+ 
+-	gserial_free_port(port);
+ 	tty_unregister_device(gs_tty_driver, port_num);
++	gserial_free_port(port);
+ }
+ EXPORT_SYMBOL_GPL(gserial_free_line);
+ 
+ int gserial_alloc_line_no_console(unsigned char *line_num)
+ {
+ 	struct usb_cdc_line_coding	coding;
+-	struct gs_port			*port;
++	struct gs_port			*port = ERR_PTR(-EBUSY);
+ 	struct device			*tty_dev;
+ 	int				ret;
+ 	int				port_num;
+@@ -1295,19 +1397,20 @@ int gserial_alloc_line_no_console(unsigned char *line_num)
+ 	coding.bDataBits = USB_CDC_1_STOP_BITS;
+ 
+ 	for (port_num = 0; port_num < MAX_U_SERIAL_PORTS; port_num++) {
+-		ret = gs_port_alloc(port_num, &coding);
+-		if (ret == -EBUSY)
+-			continue;
+-		if (ret)
++		port = gs_port_alloc(port_num, &coding);
++		if (IS_ERR(port)) {
++			ret = PTR_ERR(port);
++			if (ret == -EBUSY)
++				continue;
+ 			return ret;
++		}
+ 		break;
+ 	}
+-	if (ret)
+-		return ret;
++	if (IS_ERR(port))
++		return PTR_ERR(port);
+ 
+ 	/* ... and sysfs class devices, so mdev/udev make /dev/ttyGS* */
+ 
+-	port = ports[port_num].port;
+ 	tty_dev = tty_port_register_device(&port->port,
+ 			gs_tty_driver, port_num, NULL);
+ 	if (IS_ERR(tty_dev)) {
+@@ -1316,14 +1419,15 @@ int gserial_alloc_line_no_console(unsigned char *line_num)
+ 
+ 		ret = PTR_ERR(tty_dev);
+ 		mutex_lock(&ports[port_num].lock);
++		WARN_ON(ports[port_num].port != port);
+ 		ports[port_num].port = NULL;
+ 		mutex_unlock(&ports[port_num].lock);
+-		gserial_free_port(port);
+-		goto err;
++		tty_port_put(&port->port);
++		return ret;
+ 	}
++
+ 	*line_num = port_num;
+-err:
+-	return ret;
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(gserial_alloc_line_no_console);
+ 
+diff --git a/drivers/usb/host/pci-quirks.c b/drivers/usb/host/pci-quirks.c
+index f670e7aab98433..1dbfd697a58200 100644
+--- a/drivers/usb/host/pci-quirks.c
++++ b/drivers/usb/host/pci-quirks.c
+@@ -1195,10 +1195,11 @@ static void quirk_usb_handoff_xhci(struct pci_dev *pdev)
+ 			 && pdev->device == 0x0014)) {
+ 		val = (val | XHCI_HC_OS_OWNED) & ~XHCI_HC_BIOS_OWNED;
+ 		writel(val, base + ext_cap_offset);
+-	}
+-
+-	/* If the BIOS owns the HC, signal that the OS wants it, and wait */
+-	if (val & XHCI_HC_BIOS_OWNED) {
++	} else {
++		/*
++		 * Perform the standard handoff and leave OS ownership set to
++		 * keep the BIOS at bay during subsequent suspends.
++		 */
+ 		writel(val | XHCI_HC_OS_OWNED, base + ext_cap_offset);
+ 
+ 		/* Wait for 1 second with 10 microsecond polling interval */
+@@ -1210,7 +1211,9 @@ static void quirk_usb_handoff_xhci(struct pci_dev *pdev)
+ 			dev_warn(&pdev->dev,
+ 				 "xHCI BIOS handoff failed (BIOS bug ?) %08x\n",
+ 				 val);
+-			writel(val & ~XHCI_HC_BIOS_OWNED, base + ext_cap_offset);
++			writel((val | XHCI_HC_OS_OWNED) &
++			       ~XHCI_HC_BIOS_OWNED,
++			       base + ext_cap_offset);
+ 		}
+ 	}
+ 
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index 470bafe1802be5..55430b673f1e94 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -1166,6 +1166,12 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd, struct xhci_bus_state *bus_
+ 	if (portsc & PORT_RESET)
+ 		status |= USB_PORT_STAT_RESET;
+ 
++	/* track connect and link error status when hub is polling */
++	if (!(portsc & PORT_RESET)) {
++		port->link_inactive = (portsc & PORT_PLS_MASK) == XDEV_INACTIVE;
++		port->connected = !!(portsc & PORT_CONNECT);
++	}
++
+ 	/* USB2 and USB3 specific bits, including Port Link State */
+ 	if (hcd->speed >= HCD_USB3)
+ 		xhci_get_usb3_port_status(port, &status, portsc);
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index af8d4b74c4ba0c..75577f441cddc5 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -1903,24 +1903,38 @@ EXPORT_SYMBOL_GPL(xhci_remove_secondary_interrupter);
+ void xhci_rh_bw_cleanup(struct xhci_hcd *xhci)
+ {
+ 	struct xhci_root_port_bw_info *rh_bw;
++	struct xhci_interval_bw_table *bw_table;
++	struct xhci_interval_bw *interval_bw;
+ 	struct xhci_tt_bw_info *tt_info, *tt_next;
+ 	struct list_head *eps, *ep, *ep_next;
+ 
+ 	for (int i = 0; i < xhci->max_ports; i++) {
+ 		rh_bw = &xhci->rh_bw[i];
+ 
++		rh_bw->num_active_tts = 0;
+ 		/* Clear and free all TT bandwidth entries */
+ 		list_for_each_entry_safe(tt_info, tt_next, &rh_bw->tts, tt_list) {
+ 			list_del(&tt_info->tt_list);
+ 			kfree(tt_info);
+ 		}
+ 
++		bw_table = &rh_bw->bw_table;
++		bw_table->interval0_esit_payload = 0;
++		bw_table->bw_used = 0;
++		bw_table->ss_bw_in = 0;
++		bw_table->ss_bw_out = 0;
++
+ 		/* Clear per-interval endpoint lists */
+ 		for (int j = 0; j < XHCI_MAX_INTERVAL; j++) {
+-			eps = &rh_bw->bw_table.interval_bw[j].endpoints;
++			interval_bw = &bw_table->interval_bw[j];
++			eps = &interval_bw->endpoints;
+ 
++			interval_bw->num_packets = 0;
+ 			list_for_each_safe(ep, ep_next, eps)
+ 				list_del_init(ep);
++			interval_bw->overhead[LS_OVERHEAD_TYPE] = 0;
++			interval_bw->overhead[FS_OVERHEAD_TYPE] = 0;
++			interval_bw->overhead[HS_OVERHEAD_TYPE] = 0;
+ 		}
+ 	}
+ }
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index c23434001e9cbf..a1fa188680f586 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -65,6 +65,7 @@
+ static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
+ 			 u32 field1, u32 field2,
+ 			 u32 field3, u32 field4, bool command_must_succeed);
++static void xhci_kill_endpoint_urbs(struct xhci_hcd *xhci, int slot_id, int ep_index);
+ 
+ /*
+  * Returns zero if the TRB isn't in this segment, otherwise it returns the DMA
+@@ -962,6 +963,24 @@ static void xhci_giveback_invalidated_tds(struct xhci_hcd *xhci, struct xhci_vir
+ 	}
+ }
+ 
++static void xhci_cancel_ring_tds(struct xhci_hcd *xhci, struct xhci_virt_ep *ep,
++				 struct xhci_ring *ring, int td_status)
++{
++	struct xhci_td *tmp_td;
++	struct xhci_td *td;
++
++	/* Add all TDs on ring to cancelled td list */
++	list_for_each_entry_safe(td, tmp_td, &ring->td_list, td_list) {
++		if (list_empty(&td->cancelled_td_list)) {
++			list_add_tail(&td->cancelled_td_list,
++				      &ep->cancelled_td_list);
++			td->cancel_status = TD_DIRTY;
++			if (!td->status)
++				td->status = td_status;
++		}
++	}
++}
++
+ static int xhci_reset_halted_ep(struct xhci_hcd *xhci, unsigned int slot_id,
+ 				unsigned int ep_index, enum xhci_ep_reset_type reset_type)
+ {
+@@ -993,25 +1012,53 @@ static int xhci_handle_halted_endpoint(struct xhci_hcd *xhci,
+ {
+ 	struct xhci_port *rhub_port = ep->vdev->rhub_port;
+ 	unsigned int slot_id = ep->vdev->slot_id;
++	bool disconnected = false;
++	struct xhci_ring *ring;
+ 	int err;
+ 
+-	/*
+-	 * Avoid resetting endpoint if link is inactive or device disconnected.
+-	 * Can cause host hang.
+-	 * Device will be reset to recover an inactive link, so don't do anything
+-	 */
++	/* link is inactive or device disconnected */
+ 	if (rhub_port->link_inactive || !rhub_port->connected) {
+ 		ep->ep_state |= EP_DROP_PENDING;
+-		return -ENODEV;
++		disconnected = true;
++		if (!td && ep->ep_index != 0) {
++			xhci_kill_endpoint_urbs(xhci, slot_id, ep->ep_index);
++			return -ENODEV;
++		}
+ 	}
+ 
+-	/* add td to cancelled list and let reset ep handler take care of it */
+-	if (reset_type == EP_HARD_RESET) {
+-		ep->ep_state |= EP_HARD_CLEAR_TOGGLE;
++	/* Add halted td to cancelled list and let reset ep handler take care of it */
++	if (reset_type == EP_HARD_RESET || disconnected) {
+ 		if (td && list_empty(&td->cancelled_td_list)) {
+ 			list_add_tail(&td->cancelled_td_list, &ep->cancelled_td_list);
+ 			td->cancel_status = TD_HALTED;
++			if (disconnected && !td->status)
++				td->status = -EPROTO;
++		}
++	}
++
++	/*
++	 * Avoid resetting non-ep0 endpoints if link is inactive or device
++	 * disconnected. Can cause host hang.
++	 * Endpoints other than ep0 won't restart before the device is reset or
++	 * the endpoint is dropped, so cancel all TDs, and give back non-ep0 TDs
++	 * now instead of letting them time out. Ep0 can survive a short device
++	 * disconnect during enumeration so reset ep0 normally and clean it up.
++	 */
++	if (disconnected) {
++		ring = td ? xhci_urb_to_transfer_ring(xhci, td->urb) : ep->ring;
++		xhci_cancel_ring_tds(xhci, ep, ring, -ESHUTDOWN);
++		if (ep->ep_index != 0) {
++			xhci_dbg(xhci, "Not resetting ep %u slot %u after disconnect\n",
++				 ep->ep_index, slot_id);
++
++			xhci_process_cancelled_tds(xhci, ep);
++			xhci_kill_endpoint_urbs(xhci, slot_id, ep->ep_index);
++			return -ENODEV;
+ 		}
++		/* hard-reset a halted disconnected ep0 */
++		xhci_dbg(xhci, "Reset and clean up ep0 slot %u after disconnect\n",
++			 slot_id);
++		reset_type = EP_HARD_RESET;
+ 	}
+ 
+ 	if (ep->ep_state & EP_HALTED) {
+@@ -1020,6 +1067,9 @@ static int xhci_handle_halted_endpoint(struct xhci_hcd *xhci,
+ 		return 0;
+ 	}
+ 
++	if (reset_type == EP_HARD_RESET)
++		ep->ep_state |= EP_HARD_CLEAR_TOGGLE;
++
+ 	err = xhci_reset_halted_ep(xhci, slot_id, ep->ep_index, reset_type);
+ 	if (err)
+ 		return err;
+@@ -1070,8 +1120,9 @@ static int xhci_invalidate_cancelled_tds(struct xhci_hcd *xhci, struct xhci_virt
+ 			continue;
+ 		}
+ 
+-		/* device disconnected or link error, ep will be dropped */
+-		if (ep->ep_state & EP_DROP_PENDING) {
++		/* device disconnected or link error, non-ep0 endpoints will be dropped */
++		if (ep->ep_state & EP_DROP_PENDING && ep->ep_index != 0) {
++			td_to_noop(xhci, ep, td, false);
+ 			td->cancel_status = TD_CLEARED;
+ 			continue;
+ 		}
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 30ac1bc4559b74..fc1b0a6b04297e 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -1185,6 +1185,7 @@ int xhci_resume(struct xhci_hcd *xhci, bool power_lost, bool is_auto_resume)
+ 		for (int i = xhci->max_slots; i > 0; i--)
+ 			xhci_free_virt_devices_depth_first(xhci, i);
+ 
++		xhci->num_active_eps = 0;
+ 		xhci_rh_bw_cleanup(xhci);
+ 
+ 		xhci->cmd_ring_reserved_trbs = 0;
+@@ -1665,12 +1666,6 @@ static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flag
+ 		goto free_priv;
+ 	}
+ 
+-	if (xhci->devs[slot_id]->rhub_port->link_inactive) {
+-		xhci_dbg(xhci, "Can't queue urb, port error, link inactive\n");
+-		ret = -ENODEV;
+-		goto free_priv;
+-	}
+-
+ 	if (xhci->xhc_state & XHCI_STATE_DYING) {
+ 		xhci_dbg(xhci, "Ep 0x%x: URB %p submitted for non-responsive xHCI host.\n",
+ 			 urb->ep->desc.bEndpointAddress, urb);
+@@ -1680,6 +1675,13 @@ static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flag
+ 
+ 	ep_state = &xhci->devs[slot_id]->eps[ep_index].ep_state;
+ 
++	if (xhci->devs[slot_id]->rhub_port->link_inactive ||
++	    *ep_state & EP_DROP_PENDING) {
++		xhci_dbg(xhci, "Can't queue urb, port disconnect or link inactive\n");
++		ret = -ENODEV;
++		goto free_priv;
++	}
++
+ 	if (*ep_state & (EP_GETTING_STREAMS | EP_GETTING_NO_STREAMS)) {
+ 		xhci_warn(xhci, "WARN: Can't enqueue URB, ep in streams transition state %x\n",
+ 			  *ep_state);
+@@ -4278,6 +4280,11 @@ int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev)
+ 	 */
+ 	if (!xhci_alloc_virt_device(xhci, slot_id, udev, GFP_NOIO)) {
+ 		xhci_warn(xhci, "Could not allocate xHCI USB device data structures\n");
++		if (xhci->quirks & XHCI_EP_LIMIT_QUIRK) {
++			spin_lock_irqsave(&xhci->lock, flags);
++			xhci->num_active_eps -= 1;
++			spin_unlock_irqrestore(&xhci->lock, flags);
++		}
+ 		goto disable_slot;
+ 	}
+ 	vdev = xhci->devs[slot_id];
+@@ -4300,7 +4307,7 @@ int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev)
+ 	return 1;
+ 
+ disable_slot:
+-	xhci_disable_and_free_slot(xhci, udev->slot_id);
++	xhci_disable_and_free_slot(xhci, slot_id);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/usb/misc/usbtest.c b/drivers/usb/misc/usbtest.c
+index 8759df49be2873..e2f5e6be353acb 100644
+--- a/drivers/usb/misc/usbtest.c
++++ b/drivers/usb/misc/usbtest.c
+@@ -466,6 +466,9 @@ static int simple_io(
+ 	int			retval = 0;
+ 	unsigned long		expire;
+ 
++	if (vary && !max)
++		return -EINVAL;
++
+ 	urb->context = &completion;
+ 	while (retval == 0 && iterations-- > 0) {
+ 		init_completion(&completion);
+diff --git a/drivers/usb/serial/garmin_gps.c b/drivers/usb/serial/garmin_gps.c
+index 8020149f5658dc..a7c18a8fdf59c6 100644
+--- a/drivers/usb/serial/garmin_gps.c
++++ b/drivers/usb/serial/garmin_gps.c
+@@ -746,11 +746,7 @@ static int nat_receive(struct garmin_data *garmin_data_p,
+ 			len = GARMIN_PKTHDR_LENGTH;
+ 
+ 		if (len >= GPS_IN_BUFSIZ) {
+-			/* seems to be an invalid packet, ignore rest
+-			   of input */
+-			dev_dbg(&garmin_data_p->port->dev,
+-				"%s - packet size too large: %d\n",
+-				__func__, len);
++			/* should never end up here given the dlen check below */
+ 			garmin_data_p->insize = 0;
+ 			count = 0;
+ 			result = -EINVPKT;
+@@ -769,8 +765,17 @@ static int nat_receive(struct garmin_data *garmin_data_p,
+ 
+ 		/* do we have a complete packet ? */
+ 		if (garmin_data_p->insize >= GARMIN_PKTHDR_LENGTH) {
+-			len = GARMIN_PKTHDR_LENGTH+
+-			   getDataLength(garmin_data_p->inbuffer);
++			u32 dlen = getDataLength(garmin_data_p->inbuffer);
++
++			if (dlen >= GPS_IN_BUFSIZ - GARMIN_PKTHDR_LENGTH) {
++				/* invalid packet, ignore rest of input */
++				dev_dbg(&garmin_data_p->port->dev, "%s - invalid length: %u\n",
++					__func__, dlen);
++				garmin_data_p->insize = 0;
++				result = -EINVPKT;
++				break;
++			}
++			len = GARMIN_PKTHDR_LENGTH + dlen;
+ 			if (garmin_data_p->insize >= len) {
+ 				garmin_write_bulk(garmin_data_p->port,
+ 						   garmin_data_p->inbuffer,
+@@ -818,10 +823,9 @@ static void priv_status_resp(struct usb_serial_port *port)
+  * Garmin specific driver functions
+  ******************************************************************************/
+ 
+-static int process_resetdev_request(struct usb_serial_port *port)
++static void process_resetdev_request(struct usb_serial_port *port)
+ {
+ 	unsigned long flags;
+-	int status;
+ 	struct garmin_data *garmin_data_p = usb_get_serial_port_data(port);
+ 
+ 	spin_lock_irqsave(&garmin_data_p->lock, flags);
+@@ -830,13 +834,8 @@ static int process_resetdev_request(struct usb_serial_port *port)
+ 	garmin_data_p->serial_num = 0;
+ 	spin_unlock_irqrestore(&garmin_data_p->lock, flags);
+ 
+-	usb_kill_urb(port->interrupt_in_urb);
+-	dev_dbg(&port->dev, "%s - usb_reset_device\n", __func__);
+-	status = usb_reset_device(port->serial->dev);
+-	if (status)
+-		dev_dbg(&port->dev, "%s - usb_reset_device failed: %d\n",
+-			__func__, status);
+-	return status;
++	dev_dbg(&port->dev, "%s - usb_queue_reset_device\n", __func__);
++	usb_queue_reset_device(port->serial->interface);
+ }
+ 
+ 
+diff --git a/drivers/usb/serial/io_edgeport.c b/drivers/usb/serial/io_edgeport.c
+index eaa8f00716c87d..0fd68faa8427c0 100644
+--- a/drivers/usb/serial/io_edgeport.c
++++ b/drivers/usb/serial/io_edgeport.c
+@@ -168,6 +168,7 @@ struct edgeport_port {
+ 	struct urb		*write_urb;		/* write URB for this port */
+ 	bool			write_in_progress;	/* 'true' while a write URB is outstanding */
+ 	spinlock_t		ep_lock;
++	struct mutex		mutex;
+ 
+ 	__u8			shadowLCR;		/* last LCR value received */
+ 	__u8			shadowMCR;		/* last MCR value received */
+@@ -225,6 +226,7 @@ struct edgeport_serial {
+ 	__u8			rxStatusParam;			/* the receive status parameter */
+ 	__s16			rxBytesRemaining;		/* the number of port bytes left to read */
+ 	struct usb_serial	*serial;			/* loop back to the owner of this object */
++	struct usb_anchor	cmd_anchor;
+ };
+ 
+ /* baud rate information */
+@@ -261,9 +263,6 @@ static const struct divisor_table_entry divisor_table[] = {
+ 	{   230400,	1},
+ };
+ 
+-/* Number of outstanding Command Write Urbs */
+-static atomic_t CmdUrbs = ATOMIC_INIT(0);
+-
+ 
+ /* function prototypes */
+ 
+@@ -281,8 +280,7 @@ static void handle_new_lsr(struct edgeport_port *edge_port, __u8 lsrData,
+ static int  send_iosp_ext_cmd(struct edgeport_port *edge_port, __u8 command,
+ 				__u8 param);
+ static int  calc_baud_rate_divisor(struct device *dev, int baud_rate, int *divisor);
+-static void change_port_settings(struct tty_struct *tty,
+-				struct edgeport_port *edge_port,
++static void edge_set_termios(struct tty_struct *tty, struct usb_serial_port *port,
+ 				const struct ktermios *old_termios);
+ static int  send_cmd_write_uart_register(struct edgeport_port *edge_port,
+ 				__u8 regNum, __u8 regValue);
+@@ -777,11 +775,6 @@ static void edge_bulk_out_cmd_callback(struct urb *urb)
+ 	struct device *dev = &urb->dev->dev;
+ 	int status = urb->status;
+ 
+-	atomic_dec(&CmdUrbs);
+-	dev_dbg(dev, "%s - FREE URB %p (outstanding %d)\n", __func__, urb,
+-		atomic_read(&CmdUrbs));
+-
+-
+ 	/* clean up the transfer buffer */
+ 	kfree(urb->transfer_buffer);
+ 
+@@ -877,22 +870,22 @@ static int edge_open(struct tty_struct *tty, struct usb_serial_port *port)
+ 		}
+ 	}
+ 
+-	/* initialize our wait queues */
+-	init_waitqueue_head(&edge_port->wait_open);
+-	init_waitqueue_head(&edge_port->wait_chase);
+-	init_waitqueue_head(&edge_port->wait_command);
+-
+ 	/* initialize our port settings */
++	spin_lock_irq(&edge_port->ep_lock);
+ 	edge_port->txCredits = 0;	/* Can't send any data yet */
++	edge_port->maxTxCredits = 0;
++	edge_port->openPending = true;
++	spin_unlock_irq(&edge_port->ep_lock);
++
+ 	/* Must always set this bit to enable ints! */
++	mutex_lock(&edge_port->mutex);
+ 	edge_port->shadowMCR = MCR_MASTER_IE;
++	mutex_unlock(&edge_port->mutex);
++
+ 	edge_port->chaseResponsePending = false;
+ 
+ 	/* send a open port command */
+-	edge_port->openPending = true;
+-	edge_port->open        = false;
+ 	response = send_iosp_ext_cmd(edge_port, IOSP_CMD_OPEN_PORT, 0);
+-
+ 	if (response < 0) {
+ 		dev_err(dev, "%s - error sending open port command\n", __func__);
+ 		edge_port->openPending = false;
+@@ -902,8 +895,7 @@ static int edge_open(struct tty_struct *tty, struct usb_serial_port *port)
+ 	/* now wait for the port to be completely opened */
+ 	wait_event_timeout(edge_port->wait_open, !edge_port->openPending,
+ 								OPEN_TIMEOUT);
+-
+-	if (!edge_port->open) {
++	if (edge_port->openPending) {
+ 		/* open timed out */
+ 		dev_dbg(dev, "%s - open timeout\n", __func__);
+ 		edge_port->openPending = false;
+@@ -931,6 +923,13 @@ static int edge_open(struct tty_struct *tty, struct usb_serial_port *port)
+ 		return -ENOMEM;
+ 	}
+ 
++	if (tty)
++		edge_set_termios(tty, port, NULL);
++
++	spin_lock_irq(&edge_port->ep_lock);
++	edge_port->open = true;
++	spin_unlock_irq(&edge_port->ep_lock);
++
+ 	dev_dbg(dev, "%s - Initialize TX fifo to %d bytes\n",
+ 		__func__, edge_port->maxTxCredits);
+ 
+@@ -1090,7 +1089,9 @@ static void edge_close(struct usb_serial_port *port)
+ 
+ 	/* port->close = true; */
+ 	edge_port->closePending = false;
++	spin_lock_irq(&edge_port->ep_lock);
+ 	edge_port->open = false;
++	spin_unlock_irq(&edge_port->ep_lock);
+ 	edge_port->openPending = false;
+ 
+ 	usb_kill_urb(edge_port->write_urb);
+@@ -1132,6 +1133,12 @@ static int edge_write(struct tty_struct *tty, struct usb_serial_port *port,
+ 
+ 	spin_lock_irqsave(&edge_port->ep_lock, flags);
+ 
++	/* avoid accessing freed fifo if tty_wakeup() races with close() */
++	if (!edge_port->open) {
++		spin_unlock_irqrestore(&edge_port->ep_lock, flags);
++		return 0;
++	}
++
+ 	/* calculate number of bytes to put in fifo */
+ 	copySize = min_t(unsigned int, count,
+ 				(edge_port->txCredits - fifo->count));
+@@ -1395,9 +1402,11 @@ static void edge_throttle(struct tty_struct *tty)
+ 
+ 	/* if we are implementing RTS/CTS, toggle that line */
+ 	if (C_CRTSCTS(tty)) {
++		mutex_lock(&edge_port->mutex);
+ 		edge_port->shadowMCR &= ~MCR_RTS;
+ 		status = send_cmd_write_uart_register(edge_port, MCR,
+ 							edge_port->shadowMCR);
++		mutex_unlock(&edge_port->mutex);
+ 		if (status != 0)
+ 			return;
+ 	}
+@@ -1432,37 +1441,15 @@ static void edge_unthrottle(struct tty_struct *tty)
+ 	}
+ 	/* if we are implementing RTS/CTS, toggle that line */
+ 	if (C_CRTSCTS(tty)) {
++		mutex_lock(&edge_port->mutex);
+ 		edge_port->shadowMCR |= MCR_RTS;
+ 		send_cmd_write_uart_register(edge_port, MCR,
+ 						edge_port->shadowMCR);
++		mutex_unlock(&edge_port->mutex);
+ 	}
+ }
+ 
+ 
+-/*****************************************************************************
+- * SerialSetTermios
+- *	this function is called by the tty driver when it wants to change
+- * the termios structure
+- *****************************************************************************/
+-static void edge_set_termios(struct tty_struct *tty,
+-			     struct usb_serial_port *port,
+-			     const struct ktermios *old_termios)
+-{
+-	struct edgeport_port *edge_port = usb_get_serial_port_data(port);
+-
+-	if (edge_port == NULL)
+-		return;
+-
+-	if (!edge_port->open) {
+-		dev_dbg(&port->dev, "%s - port not opened\n", __func__);
+-		return;
+-	}
+-
+-	/* change the port settings to the new ones specified */
+-	change_port_settings(tty, edge_port, old_termios);
+-}
+-
+-
+ /*****************************************************************************
+  * get_lsr_info - get line status register info
+  *
+@@ -1499,6 +1486,7 @@ static int edge_tiocmset(struct tty_struct *tty,
+ 	struct edgeport_port *edge_port = usb_get_serial_port_data(port);
+ 	unsigned int mcr;
+ 
++	mutex_lock(&edge_port->mutex);
+ 	mcr = edge_port->shadowMCR;
+ 	if (set & TIOCM_RTS)
+ 		mcr |= MCR_RTS;
+@@ -1517,6 +1505,7 @@ static int edge_tiocmset(struct tty_struct *tty,
+ 	edge_port->shadowMCR = mcr;
+ 
+ 	send_cmd_write_uart_register(edge_port, MCR, edge_port->shadowMCR);
++	mutex_unlock(&edge_port->mutex);
+ 
+ 	return 0;
+ }
+@@ -1530,6 +1519,7 @@ static int edge_tiocmget(struct tty_struct *tty)
+ 	unsigned int mcr;
+ 
+ 	msr = edge_port->shadowMSR;
++	mutex_lock(&edge_port->mutex);
+ 	mcr = edge_port->shadowMCR;
+ 	result = ((mcr & MCR_DTR)	? TIOCM_DTR: 0)	  /* 0x002 */
+ 		  | ((mcr & MCR_RTS)	? TIOCM_RTS: 0)   /* 0x004 */
+@@ -1537,6 +1527,7 @@ static int edge_tiocmget(struct tty_struct *tty)
+ 		  | ((msr & EDGEPORT_MSR_CD)	? TIOCM_CAR: 0)   /* 0x040 */
+ 		  | ((msr & EDGEPORT_MSR_RI)	? TIOCM_RI:  0)   /* 0x080 */
+ 		  | ((msr & EDGEPORT_MSR_DSR)	? TIOCM_DSR: 0);  /* 0x100 */
++	mutex_unlock(&edge_port->mutex);
+ 
+ 	return result;
+ }
+@@ -1752,9 +1743,9 @@ static void process_rcvd_status(struct edgeport_serial *edge_serial,
+ {
+ 	struct usb_serial_port *port;
+ 	struct edgeport_port *edge_port;
+-	struct tty_struct *tty;
+ 	struct device *dev;
+ 	__u8 code = edge_serial->rxStatusCode;
++	unsigned long flags;
+ 
+ 	/* switch the port pointer to the one being currently talked about */
+ 	if (edge_serial->rxPort >= edge_serial->serial->num_ports)
+@@ -1798,24 +1789,22 @@ static void process_rcvd_status(struct edgeport_serial *edge_serial,
+ 	}
+ 
+ 	if (code == IOSP_STATUS_OPEN_RSP) {
++		spin_lock_irqsave(&edge_port->ep_lock, flags);
++		/* reject stray open responses to avoid FIFO corruption */
++		if (!edge_port->openPending) {
++			spin_unlock_irqrestore(&edge_port->ep_lock, flags);
++			return;
++		}
+ 		edge_port->txCredits = GET_TX_BUFFER_SIZE(byte3);
+ 		edge_port->maxTxCredits = edge_port->txCredits;
+ 		dev_dbg(dev, "%s - Port %u Open Response Initial MSR = %02x TxBufferSize = %d\n",
+ 			__func__, edge_serial->rxPort, byte2, edge_port->txCredits);
+ 		handle_new_msr(edge_port, byte2);
+ 
+-		/* send the current line settings to the port so we are
+-		   in sync with any further termios calls */
+-		tty = tty_port_tty_get(&edge_port->port->port);
+-		if (tty) {
+-			change_port_settings(tty,
+-				edge_port, &tty->termios);
+-			tty_kref_put(tty);
+-		}
+-
+ 		/* we have completed the open */
+ 		edge_port->openPending = false;
+-		edge_port->open = true;
++		spin_unlock_irqrestore(&edge_port->ep_lock, flags);
++
+ 		wake_up(&edge_port->wait_open);
+ 		return;
+ 	}
+@@ -2143,24 +2132,21 @@ static int write_cmd_usb(struct edgeport_port *edge_port,
+ 	if (!urb)
+ 		return -ENOMEM;
+ 
+-	atomic_inc(&CmdUrbs);
+-	dev_dbg(dev, "%s - ALLOCATE URB %p (outstanding %d)\n",
+-		__func__, urb, atomic_read(&CmdUrbs));
+-
+ 	usb_fill_bulk_urb(urb, edge_serial->serial->dev,
+ 			usb_sndbulkpipe(edge_serial->serial->dev,
+ 					edge_serial->bulk_out_endpoint),
+ 			buffer, length, edge_bulk_out_cmd_callback, edge_port);
+ 
+ 	edge_port->commandPending = true;
++	usb_anchor_urb(urb, &edge_serial->cmd_anchor);
+ 	status = usb_submit_urb(urb, GFP_ATOMIC);
+ 
+ 	if (status) {
+ 		/* something went wrong */
+ 		dev_err(dev, "%s - usb_submit_urb(write command) failed, status = %d\n",
+ 			__func__, status);
++		usb_unanchor_urb(urb);
+ 		usb_free_urb(urb);
+-		atomic_dec(&CmdUrbs);
+ 		return status;
+ 	}
+ 
+@@ -2325,18 +2311,12 @@ static int send_cmd_write_uart_register(struct edgeport_port *edge_port,
+ }
+ 
+ 
+-/*****************************************************************************
+- * change_port_settings
+- *	This routine is called to set the UART on the device to match the
+- *	specified new settings.
+- *****************************************************************************/
+-
+-static void change_port_settings(struct tty_struct *tty,
+-	struct edgeport_port *edge_port, const struct ktermios *old_termios)
++static void edge_set_termios(struct tty_struct *tty, struct usb_serial_port *port,
++		const struct ktermios *old_termios)
+ {
+-	struct device *dev = &edge_port->port->dev;
+-	struct edgeport_serial *edge_serial =
+-			usb_get_serial_data(edge_port->port->serial);
++	struct edgeport_serial *edge_serial = usb_get_serial_data(port->serial);
++	struct edgeport_port *edge_port = usb_get_serial_port_data(port);
++	struct device *dev = &port->dev;
+ 	int baud;
+ 	unsigned cflag;
+ 	__u8 mask = 0xff;
+@@ -2347,12 +2327,6 @@ static void change_port_settings(struct tty_struct *tty,
+ 	__u8 txFlow;
+ 	int status;
+ 
+-	if (!edge_port->open &&
+-	    !edge_port->openPending) {
+-		dev_dbg(dev, "%s - port not opened\n", __func__);
+-		return;
+-	}
+-
+ 	cflag = tty->termios.c_cflag;
+ 
+ 	switch (cflag & CSIZE) {
+@@ -2468,12 +2442,14 @@ static void change_port_settings(struct tty_struct *tty,
+ 		return;
+ 
+ 	/* set up the MCR register and send it to the EdgePort */
++	mutex_lock(&edge_port->mutex);
+ 	edge_port->shadowMCR = MCR_MASTER_IE;
+ 	if (cflag & CBAUD)
+ 		edge_port->shadowMCR |= (MCR_DTR | MCR_RTS);
+ 
+ 	status = send_cmd_write_uart_register(edge_port, MCR,
+ 						edge_port->shadowMCR);
++	mutex_unlock(&edge_port->mutex);
+ 	if (status != 0)
+ 		return;
+ 
+@@ -2486,7 +2462,7 @@ static void change_port_settings(struct tty_struct *tty,
+ 
+ 	dev_dbg(dev, "%s - baud rate = %d\n", __func__, baud);
+ 	status = send_cmd_write_baud_rate(edge_port, baud);
+-	if (status == -1) {
++	if (status == -1 && old_termios) {
+ 		/* Speed change was not possible - put back the old speed */
+ 		baud = tty_termios_baud_rate(old_termios);
+ 		tty_encode_baud_rate(tty, baud, baud);
+@@ -2724,6 +2700,7 @@ static int edge_startup(struct usb_serial *serial)
+ 
+ 	spin_lock_init(&edge_serial->es_lock);
+ 	edge_serial->serial = serial;
++	init_usb_anchor(&edge_serial->cmd_anchor);
+ 	usb_set_serial_data(serial, edge_serial);
+ 
+ 	/* get the name for the device from the device */
+@@ -2928,6 +2905,8 @@ static void edge_disconnect(struct usb_serial *serial)
+ {
+ 	struct edgeport_serial *edge_serial = usb_get_serial_data(serial);
+ 
++	usb_kill_anchored_urbs(&edge_serial->cmd_anchor);
++
+ 	if (edge_serial->is_epic) {
+ 		usb_kill_urb(edge_serial->interrupt_read_urb);
+ 		usb_kill_urb(edge_serial->read_urb);
+@@ -2965,6 +2944,12 @@ static int edge_port_probe(struct usb_serial_port *port)
+ 		return -ENOMEM;
+ 
+ 	spin_lock_init(&edge_port->ep_lock);
++	mutex_init(&edge_port->mutex);
++
++	init_waitqueue_head(&edge_port->wait_open);
++	init_waitqueue_head(&edge_port->wait_chase);
++	init_waitqueue_head(&edge_port->wait_command);
++
+ 	edge_port->port = port;
+ 
+ 	usb_set_serial_port_data(port, edge_port);
+diff --git a/drivers/usb/serial/oti6858.c b/drivers/usb/serial/oti6858.c
+index c6364e8ff71f95..005fe19c3cd4f1 100644
+--- a/drivers/usb/serial/oti6858.c
++++ b/drivers/usb/serial/oti6858.c
+@@ -248,7 +248,7 @@ static void setup_line(struct work_struct *work)
+ 
+ 	dev_dbg(&port->dev, "%s(): submitting interrupt urb\n", __func__);
+ 	result = usb_submit_urb(port->interrupt_in_urb, GFP_KERNEL);
+-	if (result != 0) {
++	if (result != 0 && result != -EPERM) {
+ 		dev_err(&port->dev, "%s(): usb_submit_urb() failed with error %d\n",
+ 			__func__, result);
+ 	}
+@@ -300,7 +300,7 @@ static void send_data(struct work_struct *work)
+ 
+ 		dev_dbg(&port->dev, "%s(): submitting interrupt urb\n", __func__);
+ 		result = usb_submit_urb(port->interrupt_in_urb, GFP_NOIO);
+-		if (result != 0) {
++		if (result != 0 && result != -EPERM) {
+ 			dev_err(&port->dev, "%s(): usb_submit_urb() failed with error %d\n",
+ 				__func__, result);
+ 		}
+@@ -561,6 +561,13 @@ static void oti6858_close(struct usb_serial_port *port)
+ 
+ 	dev_dbg(&port->dev, "%s(): after buf_clear()\n", __func__);
+ 
++	/*
++	 * The interrupt urb schedules the works, and the works and the bulk
++	 * urbs resubmit the interrupt urb: keep it from being submitted until
++	 * all of them are gone.
++	 */
++	usb_poison_urb(port->interrupt_in_urb);
++
+ 	/* cancel scheduled setup */
+ 	cancel_delayed_work_sync(&priv->delayed_setup_work);
+ 	cancel_delayed_work_sync(&priv->delayed_write_work);
+@@ -569,7 +576,8 @@ static void oti6858_close(struct usb_serial_port *port)
+ 	dev_dbg(&port->dev, "%s(): shutting down urbs\n", __func__);
+ 	usb_kill_urb(port->write_urb);
+ 	usb_kill_urb(port->read_urb);
+-	usb_kill_urb(port->interrupt_in_urb);
++
++	usb_unpoison_urb(port->interrupt_in_urb);
+ }
+ 
+ static int oti6858_tiocmset(struct tty_struct *tty,
+@@ -826,7 +834,7 @@ static void oti6858_write_bulk_callback(struct urb *urb)
+ 	/* schedule the interrupt urb if we are still open */
+ 	dev_dbg(&port->dev, "%s(): submitting interrupt urb\n", __func__);
+ 	result = usb_submit_urb(port->interrupt_in_urb, GFP_ATOMIC);
+-	if (result != 0) {
++	if (result != 0 && result != -EPERM) {
+ 		dev_err(&port->dev, "%s(): failed submitting int urb,"
+ 					" error %d\n", __func__, result);
+ 	}
+diff --git a/drivers/usb/serial/sierra.c b/drivers/usb/serial/sierra.c
+index f2cc7f364d2040..c6aa5dfe468b1a 100644
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -575,12 +575,24 @@ static void sierra_instat_callback(struct urb *urb)
+ 				__func__);
+ 			return;
+ 		}
++		if (urb->actual_length < sizeof(*req_pkt)) {
++			dev_err(&port->dev, "%s: short transfer\n",
++				__func__);
++			return;
++		}
+ 		if ((req_pkt->bRequestType == 0xA1) &&
+ 				(req_pkt->bRequest == 0x20)) {
+ 			int old_dcd_state;
+-			unsigned char signals = *((unsigned char *)
+-					urb->transfer_buffer +
+-					sizeof(struct usb_ctrlrequest));
++			unsigned char signals;
++
++			if (urb->actual_length < sizeof(*req_pkt) + 1) {
++				dev_err(&port->dev,
++					"%s: short interrupt transfer\n",
++					__func__);
++				return;
++			}
++			signals = *((unsigned char *)urb->transfer_buffer +
++					sizeof(*req_pkt));
+ 
+ 			dev_dbg(&port->dev, "%s: signal x%x\n", __func__,
+ 				signals);
+diff --git a/drivers/usb/serial/upd78f0730.c b/drivers/usb/serial/upd78f0730.c
+index 78c4d3c19a8ec4..f2189b994ed7b1 100644
+--- a/drivers/usb/serial/upd78f0730.c
++++ b/drivers/usb/serial/upd78f0730.c
+@@ -201,10 +201,9 @@ static int upd78f0730_tiocmget(struct tty_struct *tty)
+ 	return res;
+ }
+ 
+-static int upd78f0730_tiocmset(struct tty_struct *tty,
++static int upd78f0730_port_tiocmset(struct usb_serial_port *port,
+ 			unsigned int set, unsigned int clear)
+ {
+-	struct usb_serial_port *port = tty->driver_data;
+ 	struct upd78f0730_port_private *private;
+ 	struct upd78f0730_set_dtr_rts request;
+ 	struct device *dev = &port->dev;
+@@ -238,6 +237,13 @@ static int upd78f0730_tiocmset(struct tty_struct *tty,
+ 	return res;
+ }
+ 
++static int upd78f0730_tiocmset(struct tty_struct *tty, unsigned int set, unsigned int clear)
++{
++	struct usb_serial_port *port = tty->driver_data;
++
++	return upd78f0730_port_tiocmset(port, set, clear);
++}
++
+ static int upd78f0730_break_ctl(struct tty_struct *tty, int break_state)
+ {
+ 	struct upd78f0730_port_private *private;
+@@ -267,7 +273,6 @@ static int upd78f0730_break_ctl(struct tty_struct *tty, int break_state)
+ 
+ static void upd78f0730_dtr_rts(struct usb_serial_port *port, int on)
+ {
+-	struct tty_struct *tty = port->port.tty;
+ 	unsigned int set = 0;
+ 	unsigned int clear = 0;
+ 
+@@ -276,7 +281,7 @@ static void upd78f0730_dtr_rts(struct usb_serial_port *port, int on)
+ 	else
+ 		clear = TIOCM_DTR | TIOCM_RTS;
+ 
+-	upd78f0730_tiocmset(tty, set, clear);
++	upd78f0730_port_tiocmset(port, set, clear);
+ }
+ 
+ static speed_t upd78f0730_get_baud_rate(struct tty_struct *tty)
+diff --git a/drivers/usb/storage/uas-detect.h b/drivers/usb/storage/uas-detect.h
+index 4d3b49e5b87a9d..523a17cf0a3c10 100644
+--- a/drivers/usb/storage/uas-detect.h
++++ b/drivers/usb/storage/uas-detect.h
+@@ -78,6 +78,8 @@ static int uas_use_uas_driver(struct usb_interface *intf,
+ 	 * ASM1051 - with broken (*) uas support
+ 	 * ASM1053 - with working uas support, but problems with large xfers
+ 	 * ASM1153 - with working uas support
++	 * ASMT135x - broken uas support, shares the ASM1153 MaxPower == 0
++	 *            signature, identify it by its product string
+ 	 *
+ 	 * Devices with these chips re-use a number of device-ids over the
+ 	 * entire line, so the device-id is useless to determine if we're
+@@ -99,7 +101,11 @@ static int uas_use_uas_driver(struct usb_interface *intf,
+ 			(le16_to_cpu(udev->descriptor.idProduct) == 0x5106 ||
+ 			 le16_to_cpu(udev->descriptor.idProduct) == 0x55aa)) {
+ 		if (udev->actconfig->desc.bMaxPower == 0) {
+-			/* ASM1153, do nothing */
++			if (udev->product && strstr(udev->product, "ASMT135")) {
++				/* ASMT135x, broken uas */
++				flags |= US_FL_IGNORE_UAS;
++			}
++			/* else ASM1153, do nothing */
+ 		} else if (udev->speed < USB_SPEED_SUPER) {
+ 			/* No streams info, assume ASM1051 */
+ 			flags |= US_FL_IGNORE_UAS;
+diff --git a/drivers/usb/typec/mux/fsa4480.c b/drivers/usb/typec/mux/fsa4480.c
+index 88783f9ed44cad..c3c629212574f2 100644
+--- a/drivers/usb/typec/mux/fsa4480.c
++++ b/drivers/usb/typec/mux/fsa4480.c
+@@ -93,16 +93,9 @@ static int fsa4480_set(struct fsa4480 *fsa)
+ 		sel = FSA4480_SEL_USB;
+ 	} else if (fsa->svid) {
+ 		switch (fsa->mode) {
+-		/* DP Only */
+ 		case TYPEC_DP_STATE_C:
+-		case TYPEC_DP_STATE_E:
+-			enable |= FSA4480_ENABLE_SBU;
+-			if (reverse)
+-				sel = FSA4480_SEL_SBU_REVERSE;
+-			break;
+-
+-		/* DP + USB */
+ 		case TYPEC_DP_STATE_D:
++		case TYPEC_DP_STATE_E:
+ 		case TYPEC_DP_STATE_F:
+ 			enable |= FSA4480_ENABLE_USB | FSA4480_ENABLE_SBU;
+ 			sel = FSA4480_SEL_USB;
+diff --git a/drivers/usb/typec/mux/nb7vpq904m.c b/drivers/usb/typec/mux/nb7vpq904m.c
+index 00b2a1784e6cc8..d1856a3fd60cc7 100644
+--- a/drivers/usb/typec/mux/nb7vpq904m.c
++++ b/drivers/usb/typec/mux/nb7vpq904m.c
+@@ -396,6 +396,7 @@ static int nb7vpq904m_probe(struct i2c_client *client)
+ 		return -ENOMEM;
+ 
+ 	nb7->client = client;
++	i2c_set_clientdata(client, nb7);
+ 
+ 	nb7->regmap = devm_regmap_init_i2c(client, &nb7_regmap);
+ 	if (IS_ERR(nb7->regmap)) {
+diff --git a/drivers/usb/typec/ucsi/debugfs.c b/drivers/usb/typec/ucsi/debugfs.c
+index 77a0dd75edd3c3..3cffd3778c67e4 100644
+--- a/drivers/usb/typec/ucsi/debugfs.c
++++ b/drivers/usb/typec/ucsi/debugfs.c
+@@ -60,7 +60,8 @@ static int ucsi_cmd(void *data, u64 val)
+ 	case UCSI_GET_LPM_PPM_INFO:
+ 		ret = ucsi_send_command(ucsi, val,
+ 					&ucsi->debugfs->response,
+-					sizeof(ucsi->debugfs->response));
++					min(sizeof(ucsi->debugfs->response),
++					    UCSI_MAX_DATA_LENGTH(ucsi)));
+ 		break;
+ 	default:
+ 		ret = -EOPNOTSUPP;
+diff --git a/drivers/usb/typec/ucsi/ucsi.c b/drivers/usb/typec/ucsi/ucsi.c
+index 5aab8ab9f0132d..9e453d216c169b 100644
+--- a/drivers/usb/typec/ucsi/ucsi.c
++++ b/drivers/usb/typec/ucsi/ucsi.c
+@@ -2106,7 +2106,7 @@ static int ucsi_init(struct ucsi *ucsi)
+ 		goto err_reset;
+ 
+ 	if (!ucsi->cap.num_connectors) {
+-		ret = -ENODEV;
++		ret = -EAGAIN;
+ 		goto err_reset;
+ 	}
+ 	/* Check if reserved bit set. This is out of spec but happens in buggy FW */
+@@ -2134,6 +2134,14 @@ static int ucsi_init(struct ucsi *ucsi)
+ 			goto err_unregister;
+ 	}
+ 
++	/*
++	 * Set ucsi->connector before enabling notifications. A connector
++	 * change event can be handled as soon as the notifications are
++	 * enabled below, and ucsi_connector_change() indexes into
++	 * ucsi->connector, so it must not be NULL at that point.
++	 */
++	ucsi->connector = connector;
++
+ 	/* Enable all supported notifications */
+ 	ntfy = ucsi_get_supported_notifications(ucsi);
+ 	command = UCSI_SET_NOTIFICATION_ENABLE | ntfy;
+@@ -2141,7 +2149,6 @@ static int ucsi_init(struct ucsi *ucsi)
+ 	if (ret < 0)
+ 		goto err_unregister;
+ 
+-	ucsi->connector = connector;
+ 	ucsi->ntfy = ntfy;
+ 
+ 	mutex_lock(&ucsi->ppm_lock);
+@@ -2155,6 +2162,7 @@ static int ucsi_init(struct ucsi *ucsi)
+ 	return 0;
+ 
+ err_unregister:
++	ucsi->connector = NULL;
+ 	for (con = connector; con->port; con++)
+ 		ucsi_unregister_port(con);
+ 	for (i = 0; i < ucsi->cap.num_connectors; i++)
+@@ -2164,6 +2172,16 @@ static int ucsi_init(struct ucsi *ucsi)
+ err_reset:
+ 	memset(&ucsi->cap, 0, sizeof(ucsi->cap));
+ 	ucsi_reset_ppm(ucsi);
++
++	/*
++	 * The only -EINVAL expected on this path is ucsi_read_error()'s:
++	 * the PPM rejected a standard command. Some PPMs do that, or
++	 * report zero connectors above, for a short while after boot
++	 * before they are ready. Report both as -EAGAIN so that
++	 * ucsi_init_work() can retry them, and only them.
++	 */
++	if (ret == -EINVAL)
++		ret = -EAGAIN;
+ err:
+ 	return ret;
+ }
+@@ -2241,16 +2259,23 @@ static void ucsi_init_work(struct work_struct *work)
+ 	}
+ 
+ 	/*
+-	 * On some platforms the PPM is not ready to answer commands
+-	 * correctly for a short window during boot: standard commands are
+-	 * rejected or GET_CAPABILITY reports zero connectors, seen as
+-	 * -EINVAL or -ENODEV from ucsi_init(), and a retry moments later
+-	 * succeeds (observed on Lenovo ThinkPad X1 Carbon Gen 14, where
+-	 * this affects roughly half of all boots). Retry those like the
+-	 * USB role switch wait instead of giving up on the first attempt.
++	 * -EPROBE_DEFER: the USB role switch is not registered yet. Wait
++	 * up to ten seconds for it.
++	 *
++	 * -EAGAIN: the PPM is not ready to answer commands correctly yet.
++	 * On some platforms that lasts for a short window during boot
++	 * (observed on Lenovo ThinkPad X1 Carbon Gen 14, where it affects
++	 * roughly half of all boots and a retry moments later succeeds).
++	 * One second is plenty for that.
++	 *
++	 * Anything else is not going to change with a retry, so report it
++	 * once and stop.
+ 	 */
+-	if (ret == -EPROBE_DEFER || ret == -ENODEV || ret == -EINVAL) {
+-		if (ucsi->work_count++ < UCSI_ROLE_SWITCH_WAIT_COUNT) {
++	if (ret == -EPROBE_DEFER || ret == -EAGAIN) {
++		int limit = ret == -EPROBE_DEFER ? UCSI_ROLE_SWITCH_WAIT_COUNT :
++						 UCSI_PPM_READY_WAIT_COUNT;
++
++		if (ucsi->work_count++ < limit) {
+ 			dev_dbg(ucsi->dev, "PPM init failed (%pe), retrying\n",
+ 				ERR_PTR(ret));
+ 			queue_delayed_work(system_dfl_long_wq, &ucsi->work,
+diff --git a/drivers/usb/typec/ucsi/ucsi.h b/drivers/usb/typec/ucsi/ucsi.h
+index 1996f04ed5e68d..140d34e90c7c4c 100644
+--- a/drivers/usb/typec/ucsi/ucsi.h
++++ b/drivers/usb/typec/ucsi/ucsi.h
+@@ -491,6 +491,7 @@ struct ucsi {
+ #define UCSI_ROLE_SWITCH_RETRY_PER_HZ	10
+ #define UCSI_ROLE_SWITCH_INTERVAL	(HZ / UCSI_ROLE_SWITCH_RETRY_PER_HZ)
+ #define UCSI_ROLE_SWITCH_WAIT_COUNT	(10 * UCSI_ROLE_SWITCH_RETRY_PER_HZ)
++#define UCSI_PPM_READY_WAIT_COUNT	(1 * UCSI_ROLE_SWITCH_RETRY_PER_HZ)
+ 
+ 	/* PPM Communication lock */
+ 	struct mutex ppm_lock;
+diff --git a/drivers/usb/typec/ucsi/ucsi_acpi.c b/drivers/usb/typec/ucsi/ucsi_acpi.c
+index 2d079d7177ac54..aae358f23268c2 100644
+--- a/drivers/usb/typec/ucsi/ucsi_acpi.c
++++ b/drivers/usb/typec/ucsi/ucsi_acpi.c
+@@ -148,6 +148,34 @@ static const struct ucsi_operations ucsi_acer_ops = {
+ 	.async_control = ucsi_acpi_async_control
+ };
+ 
++static int ucsi_hp_read_version(struct ucsi *ucsi, u16 *version)
++{
++	struct ucsi_acpi *ua = ucsi_get_drvdata(ucsi);
++	int ret;
++
++	ret = ucsi_acpi_read_version(ucsi, version);
++	if (ret)
++		return ret;
++
++	/* Firmware fills in VERSION (1.0) only after the first command completes */
++	if (!*version) {
++		dev_warn(ua->dev, "UCSI version is zero, assuming 1.0\n");
++		*version = UCSI_VERSION_1_0;
++	}
++
++	return 0;
++}
++
++static const struct ucsi_operations ucsi_hp_ops = {
++	.read_version = ucsi_hp_read_version,
++	.read_cci = ucsi_acpi_read_cci,
++	.poll_cci = ucsi_acpi_poll_cci,
++	.read_message_in = ucsi_acpi_read_message_in,
++	.write_message_out = ucsi_acpi_write_message_out,
++	.sync_control = ucsi_sync_control_common,
++	.async_control = ucsi_acpi_async_control
++};
++
+ static int ucsi_gram_sync_control(struct ucsi *ucsi, u64 command, u32 *cci,
+ 				  void *val, size_t len, void *msg_out,
+ 				  size_t msg_out_size)
+@@ -196,6 +224,13 @@ static const struct dmi_system_id ucsi_acpi_quirks[] = {
+ 		},
+ 		.driver_data = (void *)&ucsi_acer_ops,
+ 	},
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "HP"),
++			DMI_MATCH(DMI_BOARD_NAME, "8ED9"),
++		},
++		.driver_data = (void *)&ucsi_hp_ops,
++	},
+ 	{
+ 		.matches = {
+ 			DMI_MATCH(DMI_SYS_VENDOR, "LG Electronics"),

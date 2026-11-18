@@ -1,0 +1,364 @@
+diff --git a/drivers/tty/serial/8250/8250_exar.c b/drivers/tty/serial/8250/8250_exar.c
+index 2737a09cf8be19..42e55a8f8c69be 100644
+--- a/drivers/tty/serial/8250/8250_exar.c
++++ b/drivers/tty/serial/8250/8250_exar.c
+@@ -1181,7 +1181,7 @@ static int xr17v35x_register_gpio(struct exar8250 *priv, struct pci_dev *pcidev,
+ 
+ static void xr17v35x_unregister_gpio(struct exar8250 *priv)
+ {
+-	if (priv->gpio) {
++	if (!IS_ERR_OR_NULL(priv->gpio)) {
+ 		__xr17v35x_unregister_gpio(priv->gpio);
+ 		priv->gpio = NULL;
+ 	}
+diff --git a/drivers/tty/serial/8250/8250_hp300.c b/drivers/tty/serial/8250/8250_hp300.c
+index e9599c5c2feada..68ce5972c296b3 100644
+--- a/drivers/tty/serial/8250/8250_hp300.c
++++ b/drivers/tty/serial/8250/8250_hp300.c
+@@ -34,29 +34,6 @@ struct hp300_port {
+ static struct hp300_port *hp300_ports;
+ #endif
+ 
+-#ifdef CONFIG_HPDCA
+-
+-static int hpdca_init_one(struct dio_dev *d,
+-					const struct dio_device_id *ent);
+-static void hpdca_remove_one(struct dio_dev *d);
+-
+-static struct dio_device_id hpdca_dio_tbl[] = {
+-	{ DIO_ID_DCA0 },
+-	{ DIO_ID_DCA0REM },
+-	{ DIO_ID_DCA1 },
+-	{ DIO_ID_DCA1REM },
+-	{ 0 }
+-};
+-
+-static struct dio_driver hpdca_driver = {
+-	.name      = "hpdca",
+-	.id_table  = hpdca_dio_tbl,
+-	.probe     = hpdca_init_one,
+-	.remove    = hpdca_remove_one,
+-};
+-
+-#endif
+-
+ static unsigned int num_ports;
+ 
+ extern int hp300_uart_scode;
+@@ -197,6 +174,32 @@ static int hpdca_init_one(struct dio_dev *d,
+ 
+ 	return 0;
+ }
++
++static void hpdca_remove_one(struct dio_dev *d)
++{
++	struct uart_8250_port *uport = dio_get_drvdata(d);
++
++	if (d->resource.start) {
++		/* Disable board-interrupts */
++		out_8(d->resource.start + DIO_VIRADDRBASE + DCA_IC, 0);
++	}
++	serial8250_unregister_port(uport);
++}
++
++static struct dio_device_id hpdca_dio_tbl[] = {
++	{ DIO_ID_DCA0 },
++	{ DIO_ID_DCA0REM },
++	{ DIO_ID_DCA1 },
++	{ DIO_ID_DCA1REM },
++	{ 0 }
++};
++
++static struct dio_driver hpdca_driver = {
++	.name      = "hpdca",
++	.id_table  = hpdca_dio_tbl,
++	.probe     = hpdca_init_one,
++	.remove    = hpdca_remove_one,
++};
+ #endif
+ 
+ static int __init hp300_8250_init(void)
+@@ -280,19 +283,6 @@ static int __init hp300_8250_init(void)
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_HPDCA
+-static void hpdca_remove_one(struct dio_dev *d)
+-{
+-	struct uart_8250_port *uport = dio_get_drvdata(d);
+-
+-	if (d->resource.start) {
+-		/* Disable board-interrupts */
+-		out_8(d->resource.start + DIO_VIRADDRBASE + DCA_IC, 0);
+-	}
+-	serial8250_unregister_port(uport);
+-}
+-#endif
+-
+ static void __exit hp300_8250_exit(void)
+ {
+ #ifdef CONFIG_HPAPCI
+diff --git a/drivers/tty/serial/8250/8250_lpss.c b/drivers/tty/serial/8250/8250_lpss.c
+index f94a54cc57ca93..fc9ac24340e6f1 100644
+--- a/drivers/tty/serial/8250/8250_lpss.c
++++ b/drivers/tty/serial/8250/8250_lpss.c
+@@ -83,6 +83,9 @@ static void byt_set_termios(struct uart_port *p, struct ktermios *termios,
+ 	/* Gracefully handle the B0 case: fall back to B9600 */
+ 	fuart = fuart ? fuart : 9600 * 16;
+ 
++	/* Fuart <= Fref: leave it to the core to refuse a higher baud rate */
++	fuart = min(fuart, fref);
++
+ 	/* Get Fuart closer to Fref */
+ 	fuart *= rounddown_pow_of_two(fref / fuart);
+ 
+diff --git a/drivers/tty/serial/8250/8250_mxpcie.c b/drivers/tty/serial/8250/8250_mxpcie.c
+index a4e45e3923ae7c..0a3fb63991c1ca 100644
+--- a/drivers/tty/serial/8250/8250_mxpcie.c
++++ b/drivers/tty/serial/8250/8250_mxpcie.c
+@@ -412,7 +412,7 @@ static int mxpcie8250_handle_irq(struct uart_port *port)
+ static void mxpcie8250_software_break_ctl(struct uart_port *port, int break_state)
+ {
+ 	struct uart_8250_port *up = up_to_u8250p(port);
+-	struct tty_struct *tty = port->state->port.tty;
++	struct tty_struct *tty;
+ 	unsigned int baud, quot;
+ 	u8 sfr, tx_byte = 0x01;
+ 
+@@ -439,9 +439,14 @@ static void mxpcie8250_software_break_ctl(struct uart_port *port, int break_stat
+ 
+ 		serial_out(up, UART_FCR, UART_FCR_CLEAR_XMIT);
+ 
+-		baud = tty_get_baud_rate(tty);
+-		quot = uart_get_divisor(port, baud);
+-		serial8250_do_set_divisor(port, baud, quot);
++		/* A hangup during the break detaches the tty */
++		tty = tty_port_tty_get(&port->state->port);
++		if (tty) {
++			baud = tty_get_baud_rate(tty);
++			quot = uart_get_divisor(port, baud);
++			serial8250_do_set_divisor(port, baud, quot);
++			tty_kref_put(tty);
++		}
+ 		serial_out(up, UART_LCR, up->lcr);
+ 	}
+ }
+diff --git a/drivers/tty/serial/fsl_lpuart.c b/drivers/tty/serial/fsl_lpuart.c
+index 6ccc6a8b653b05..cd2575a3aef74c 100644
+--- a/drivers/tty/serial/fsl_lpuart.c
++++ b/drivers/tty/serial/fsl_lpuart.c
+@@ -3113,8 +3113,14 @@ static int lpuart_resume_noirq(struct device *dev)
+ 			/* check whether lpuart wakeup was triggered */
+ 			wake_active = stat & (UARTSTAT_RDRF | UARTSTAT_RXEDGIF);
+ 
+-			if (wake_active && irqd_is_wakeup_set(irq_get_irq_data(sport->port.irq)))
+-				pm_wakeup_event(tty_port_tty_get(port)->dev, 0);
++			if (wake_active && irqd_is_wakeup_set(irq_get_irq_data(sport->port.irq))) {
++				struct tty_struct *tty = tty_port_tty_get(port);
++
++				if (tty) {
++					pm_wakeup_event(tty->dev, 0);
++					tty_kref_put(tty);
++				}
++			}
+ 		}
+ 	}
+ 
+diff --git a/drivers/tty/serial/imx.c b/drivers/tty/serial/imx.c
+index 256d85e398d13f..0831bd5ee3dc25 100644
+--- a/drivers/tty/serial/imx.c
++++ b/drivers/tty/serial/imx.c
+@@ -2742,8 +2742,14 @@ static void imx_uart_enable_wakeup(struct imx_port *sport, bool on)
+ 		imx_uart_writel(sport, ucr1, UCR1);
+ 	}
+ 
+-	if (wake_active && irqd_is_wakeup_set(irq_get_irq_data(sport->port.irq)))
+-		pm_wakeup_event(tty_port_tty_get(port)->dev, 0);
++	if (wake_active && irqd_is_wakeup_set(irq_get_irq_data(sport->port.irq))) {
++		struct tty_struct *tty = tty_port_tty_get(port);
++
++		if (tty) {
++			pm_wakeup_event(tty->dev, 0);
++			tty_kref_put(tty);
++		}
++	}
+ 
+ 	uart_port_unlock_irq(&sport->port);
+ }
+diff --git a/drivers/tty/serial/rda-uart.c b/drivers/tty/serial/rda-uart.c
+index 9da58ffa02d545..cf1886ab1d2bcd 100644
+--- a/drivers/tty/serial/rda-uart.c
++++ b/drivers/tty/serial/rda-uart.c
+@@ -471,6 +471,8 @@ static void rda_uart_shutdown(struct uart_port *port)
+ 	rda_uart_write(port, val, RDA_UART_CTRL);
+ 
+ 	uart_port_unlock_irqrestore(port, flags);
++
++	free_irq(port->irq, port);
+ }
+ 
+ static const char *rda_uart_type(struct uart_port *port)
+diff --git a/drivers/tty/serial/samsung_tty.c b/drivers/tty/serial/samsung_tty.c
+index 738536014742eb..7ce8f2f993e215 100644
+--- a/drivers/tty/serial/samsung_tty.c
++++ b/drivers/tty/serial/samsung_tty.c
+@@ -736,14 +736,13 @@ static irqreturn_t s3c24xx_serial_rx_chars_dma(struct s3c24xx_uart_port *ourport
+ 
+ 	s3c24xx_serial_rx_drain_fifo(ourport);
+ 
+-	if (tty) {
++	if (tty)
+ 		tty_flip_buffer_push(t);
+-		tty_kref_put(tty);
+-	}
+ 
+ 	wr_regl(port, S3C2410_UTRSTAT, S3C2410_UTRSTAT_TIMEOUT);
+ 
+ finish:
++	tty_kref_put(tty);
+ 	uart_port_unlock(port);
+ 
+ 	return IRQ_HANDLED;
+@@ -1502,11 +1501,14 @@ static void s3c24xx_serial_set_termios(struct uart_port *port,
+ 
+ 		if (!IS_ERR(ourport->baudclk)) {
+ 			clk_disable_unprepare(ourport->baudclk);
++			clk_put(ourport->baudclk);
+ 			ourport->baudclk = ERR_PTR(-EINVAL);
+ 		}
+ 
+ 		ourport->baudclk = clk;
+ 		ourport->baudclk_rate = clk ? clk_get_rate(clk) : 0;
++	} else {
++		clk_put(clk);
+ 	}
+ 
+ 	if (ourport->info->has_divslot) {
+diff --git a/drivers/tty/serial/serial_core.c b/drivers/tty/serial/serial_core.c
+index c0deec0e6af41d..b06d2649be343a 100644
+--- a/drivers/tty/serial/serial_core.c
++++ b/drivers/tty/serial/serial_core.c
+@@ -135,17 +135,11 @@ static void uart_stop(struct tty_struct *tty)
+ 	uart_port_unlock_deref(port, flags);
+ }
+ 
+-static void __uart_start(struct uart_state *state)
++static void uart_port_start_tx(struct uart_port *port)
+ {
+-	struct uart_port *port = state->uart_port;
+-	struct serial_port_device *port_dev;
++	struct serial_port_device *port_dev = port->port_dev;
+ 	int err;
+ 
+-	if (!port || port->flags & UPF_DEAD || uart_tx_stopped(port))
+-		return;
+-
+-	port_dev = port->port_dev;
+-
+ 	/* Increment the runtime PM usage count for the active check below */
+ 	err = pm_runtime_get(&port_dev->dev);
+ 	if (err < 0 && err != -EINPROGRESS) {
+@@ -164,6 +158,16 @@ static void __uart_start(struct uart_state *state)
+ 	pm_runtime_put_autosuspend(&port_dev->dev);
+ }
+ 
++static void __uart_start(struct uart_state *state)
++{
++	struct uart_port *port = state->uart_port;
++
++	if (!port || port->flags & UPF_DEAD || uart_tx_stopped(port))
++		return;
++
++	uart_port_start_tx(port);
++}
++
+ static void uart_start(struct tty_struct *tty)
+ {
+ 	struct uart_state *state = tty->driver_data;
+@@ -718,8 +722,9 @@ static void uart_send_xchar(struct tty_struct *tty, u8 ch)
+ 	else {
+ 		guard(uart_port_lock_irqsave)(port);
+ 		port->x_char = ch;
+-		if (ch)
+-			port->ops->start_tx(port);
++		/* It goes out even if the transmission is stopped */
++		if (ch && !(port->flags & UPF_DEAD))
++			uart_port_start_tx(port);
+ 	}
+ 	uart_port_deref(port);
+ }
+diff --git a/drivers/tty/serial/serial_port.c b/drivers/tty/serial/serial_port.c
+index 2fc48cd63f6cff..f2f7cdd3a54c9a 100644
+--- a/drivers/tty/serial/serial_port.c
++++ b/drivers/tty/serial/serial_port.c
+@@ -23,8 +23,8 @@
+ /* Only considers pending TX for now. Caller must take care of locking */
+ static int __serial_port_busy(struct uart_port *port)
+ {
+-	return !uart_tx_stopped(port) &&
+-		!kfifo_is_empty(&port->state->port.xmit_fifo);
++	return port->x_char || (!uart_tx_stopped(port) &&
++		!kfifo_is_empty(&port->state->port.xmit_fifo));
+ }
+ 
+ static int serial_port_runtime_resume(struct device *dev)
+diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
+index 1a6c8a1bc764a3..150052f6d9dbf2 100644
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@ -2969,8 +2969,7 @@ static long tty_compat_ioctl(struct file *file, unsigned int cmd,
+ 	if (ld->ops->compat_ioctl)
+ 		retval = ld->ops->compat_ioctl(tty, cmd, arg);
+ 	if (retval == -ENOIOCTLCMD && ld->ops->ioctl)
+-		retval = ld->ops->ioctl(tty, (unsigned long)compat_ptr(cmd),
+-				arg);
++		retval = ld->ops->ioctl(tty, cmd, (unsigned long)compat_ptr(arg));
+ 	tty_ldisc_deref(ld);
+ 
+ 	return retval;
+diff --git a/drivers/tty/vt/keyboard.c b/drivers/tty/vt/keyboard.c
+index d59d51dafa55ef..51d6d42519cfc4 100644
+--- a/drivers/tty/vt/keyboard.c
++++ b/drivers/tty/vt/keyboard.c
+@@ -322,15 +322,20 @@ int kbd_rate(struct kbd_repeat *rpt)
+ 
+ /*
+  * Helper Functions.
++ *
++ * A flip buffer allows one producer at a time, and respond_string() in vt.c
++ * feeds the same one under the console lock. So take the lock of the port.
+  */
+ static void put_queue(struct vc_data *vc, int ch)
+ {
++	guard(spinlock_irqsave)(&vc->port.lock);
+ 	tty_insert_flip_char(&vc->port, ch, 0);
+ 	tty_flip_buffer_push(&vc->port);
+ }
+ 
+ static void puts_queue(struct vc_data *vc, const char *cp)
+ {
++	guard(spinlock_irqsave)(&vc->port.lock);
+ 	tty_insert_flip_string(&vc->port, cp, strlen(cp));
+ 	tty_flip_buffer_push(&vc->port);
+ }
+@@ -587,6 +592,7 @@ static void fn_inc_console(struct vc_data *vc)
+ 
+ static void fn_send_intr(struct vc_data *vc)
+ {
++	guard(spinlock_irqsave)(&vc->port.lock);
+ 	tty_insert_flip_char(&vc->port, 0, TTY_BREAK);
+ 	tty_flip_buffer_push(&vc->port);
+ }
+diff --git a/drivers/tty/vt/vt.c b/drivers/tty/vt/vt.c
+index 7dbc0072a40a95..6a6eb8b2a6dece 100644
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@ -1971,6 +1971,8 @@ static void csi_m(struct vc_data *vc)
+ 
+ static void respond_string(const char *p, size_t len, struct tty_port *port)
+ {
++	/* The keyboard handler feeds the same flip buffer. */
++	guard(spinlock_irqsave)(&port->lock);
+ 	tty_insert_flip_string(port, p, len);
+ 	tty_flip_buffer_push(port);
+ }
