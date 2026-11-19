@@ -51,7 +51,18 @@ Whole-diff **Signal X-Ray & Partition Forecast**, risk/path filtering, `Meat / N
 
 ## Truth Model: What Is Deterministic vs. Heuristic
 
-Agents and human reviewers should know which outputs are mathematically guaranteed and which are triage hints:
+### Quick Guide: The 4 Dashboard KPI Cards (Plain English)
+
+| KPI Card | Type | What It Answers | How to Trust It |
+|---|---|---|---|
+| **Target & Churn** | **EXACT** | What diff you selected, and its raw size (files, hunks, `+`/`-` lines). | Exact count from the diff. |
+| **Meat vs. Noise X-Ray** | **EXACT** | How many lines change program behavior (**Meat**) vs. pure imports, lockfiles, and byte-exact moves (**Noise**). | Exact byte checks. *(Note: moving identical lines into a new `if` block or lock can still change behavior, so move markers `L_old <-> L_new` stay visible.)* |
+| **State & Risk** | **GUIDE** | Which files touch control-flow cues (`state`, `err`, `retry`, `async`, added/removed checks `guard` / `rm-guard`). | **Reading order only — not proof of safety.** Can miss bugs with no control-flow keywords (e.g., `<=` → `<`, swapped arguments, bad config/SQL) and can flag harmless cleanups. |
+| **Integrity & Budget** | **EXACT** | Exact SHA-256 fingerprint, byte size, and whether the diff fits in 1 AI pass or splits into chunks. | Exact byte truth. If 1 character changes, the hash changes and saved claims turn stale. |
+
+> **Simple Trust Rule:** Use **State & Risk** to decide **which file to read first**, never to skip reading a `Low Risk` file or prove a change has no bugs. Always read the **Meat** diff and run tests.
+
+### Detailed Contract Table
 
 | Output | Guarantee | How It Works | Safe Agent Usage |
 |---|---|---|---|
@@ -60,7 +71,7 @@ Agents and human reviewers should know which outputs are mathematically guarante
 | **Generated / Lockfiles (`gen`)** | **Deterministic (Pattern/Banner)** | Matches standard lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, `go.sum`, `poetry.lock`, etc.), minified/generated suffixes, and explicit `Code generated ... DO NOT EDIT` / `@generated` banners (`src/cli/shape.ts`). | Safe to fold out of first-pass reading; counts remain explicitly reported in X-Ray and `columbo.triage.v1`. |
 | **Behavioral Meat (`meat` / `m`)** | **Conservative Residual** | `totalChangedLines - imp - mov - gen`. Anything not proven to be an import, byte-exact move, or generated/lockfile stays in `meat` (no speculative hiding in offline X-Ray). | Never hides a behavioral edit, though formatting/comment tweaks remain until full LLM abridging runs. |
 | **Snapshot SHA, Partitions & Stale State** | **Deterministic** | SHA-256 `input_digest`, UTF-8 byte ranges (`-inventory`/`-evidence`), and `columbo-state-v1` byte checks (`needs_recheck`, scoped strictly to local Git targets). | Safe ground truth for pagination and freshness checks. |
-| **`Risk` (`high`/`med`/`low`), Signals & `State Flow`** | **Heuristic Triage** | Regex scans over diff hunks for removed/added branch guards, state writes, error/kernel recovery idioms (`IS_ERR*`, `WARN_ON*`, `-E*`, `try`/`catch`/`throw`), async/locks, and retry/cancel cues (`src/cli/dashboard.ts`, `src/cli/statechart.ts`). | **Priority pointer only.** A `low` rating does not prove safety (e.g., subtle single-line pointer or arithmetic bugs still require reading the code). |
+| **`Risk` (`high`/`med`/`low`), Signals & `State Flow`** | **Heuristic Triage** | Regex scans over diff hunks for removed/added branch guards, state writes, error/kernel recovery idioms (`IS_ERR*`, `WARN_ON*`, `-E*`, `try`/`catch`/`throw`), async/locks, and retry/cancel cues (`src/cli/dashboard.ts`, `src/cli/statechart.ts`). | **Priority pointer only.** A `low` rating does not prove safety (e.g., subtle single-line pointer, argument-order, or arithmetic bugs still require reading the code). |
 
 ---
 

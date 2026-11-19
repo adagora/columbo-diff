@@ -585,6 +585,35 @@ const INDEX_HTML = `<!doctype html>
       justify-content: space-between;
       gap: 6px;
     }
+    .stat-label-meta {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+    .kind-tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 1px 5px;
+      border-radius: 2px;
+      border: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 9.5px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      line-height: 1.35;
+      text-transform: uppercase;
+    }
+    .kind-tag.exact {
+      color: var(--green);
+      border-color: rgba(115, 191, 105, 0.35);
+      background: rgba(115, 191, 105, 0.08);
+    }
+    .kind-tag.guide {
+      color: var(--amber);
+      border-color: rgba(255, 152, 48, 0.4);
+      background: rgba(255, 152, 48, 0.1);
+    }
     .stat-value {
       font-size: 20px;
       font-weight: 700;
@@ -957,41 +986,53 @@ const INDEX_HTML = `<!doctype html>
         <div class="panel stat-panel">
           <div class="stat-label">
             <span>Target &amp; Churn</span>
-            <button class="tip-btn" type="button" aria-label="Explain Target and Churn metric" aria-expanded="false" data-tip-title="Target &amp; Churn" data-tip="Selected diff source, total changed files, contiguous diff hunks, and raw added (+) vs. removed (-) lines before noise filtering.">?</button>
+            <span class="stat-label-meta">
+              <span class="kind-tag exact" data-tip-title="Exact Fact" data-tip="Exact counts directly from the raw unified diff. No guessing or AI.">EXACT</span>
+              <button class="tip-btn" type="button" aria-label="Explain Target and Churn metric" aria-expanded="false" data-tip-title="Target &amp; Churn (Exact Fact)" data-tip="Shows what diff you selected and its raw size before filtering: changed files, edit blocks (hunks), and total added (+) vs. deleted (-) lines.">?</button>
+            </span>
           </div>
           <div id="kpiTarget" class="stat-value">-</div>
-          <div id="kpiScope" class="stat-foot mono" data-tip-title="Raw Scope" data-tip="File count, contiguous unified-diff hunk count, and raw added/deleted lines.">-</div>
+          <div id="kpiScope" class="stat-foot mono" data-tip-title="Raw Scope (Exact Fact)" data-tip="Exact count of changed files, diff hunks, and raw + / - lines before noise filtering.">-</div>
         </div>
         <div class="panel stat-panel">
           <div class="stat-label">
             <span>Meat vs. Noise X-Ray</span>
-            <button class="tip-btn" type="button" aria-label="Explain Meat vs. Noise X-Ray metric" aria-expanded="false" data-tip-title="Meat vs. Noise X-Ray" data-tip="Behavioral lines remaining after Columbo deterministically strips pure import churn (imp) and byte-for-byte cross-hunk code moves (mov) without an LLM.">?</button>
+            <span class="stat-label-meta">
+              <span class="kind-tag exact" data-tip-title="Exact Fact" data-tip="Byte-level checks only. Strips pure imports, lockfiles, and byte-identical moved lines without AI.">EXACT</span>
+              <button class="tip-btn" type="button" aria-label="Explain Meat vs. Noise X-Ray metric" aria-expanded="false" data-tip-title="Meat vs. Noise X-Ray (Exact Fact)" data-tip="Meat = changed lines that can change program behavior. Noise = pure imports (imp), byte-identical moved lines (mov), and generated/lockfiles. Note: moving identical code into a new if-block or lock can still change behavior, so move coordinates stay visible.">?</button>
+            </span>
           </div>
-          <div id="kpiXray" class="stat-value mono" data-tip-title="Behavioral Meat" data-tip="Changed lines containing real behavioral logic rather than import sorting or verbatim code relocation.">-</div>
-          <div id="kpiXraySub" class="stat-foot mono" data-tip-title="Filtered Noise Breakdown" data-tip="Percentage of raw diff lines filtered out as pure import edits (imp) or exact cross-hunk moves (mov).">-</div>
+          <div id="kpiXray" class="stat-value mono" data-tip-title="Behavioral Meat (Exact Fact)" data-tip="Changed lines left after removing pure imports, lockfiles, and byte-exact moves. Read these lines first.">-</div>
+          <div id="kpiXraySub" class="stat-foot mono" data-tip-title="Filtered Noise Breakdown" data-tip="Percent of raw changed lines proven to be pure imports (imp) or byte-exact moves (mov).">-</div>
         </div>
         <div class="panel stat-panel">
           <div class="stat-label">
             <span>State &amp; Risk</span>
-            <button class="tip-btn" type="button" aria-label="Explain State and Risk metric" aria-expanded="false" data-tip-title="State &amp; Risk Signals (Heuristic)" data-tip="Regex cues from diff hunks: state updates, error/kernel recovery paths (err), retry/cancel cues, async/lock cues, added guards, and removed guards. Recommends a statechart when control-flow cues >= 2 or any guard is removed. Triage only, not proof of safety.">?</button>
+            <span class="stat-label-meta">
+              <span class="kind-tag guide" data-tip-title="Heuristic Guide (Not Proof)" data-tip="Fast text-pattern scan for reading order only. Low risk does NOT prove a file has no bugs (it can miss off-by-one math, swapped arguments, or bad config).">GUIDE</span>
+              <button class="tip-btn" type="button" aria-label="Explain State and Risk metric" aria-expanded="false" data-tip-title="State &amp; Risk (Heuristic Guide — Not Proof)" data-tip="Scans changed lines for control-flow patterns (state writes, error paths, retries, locks, added/removed safety checks) to rank which files to read first. Use for reading order only — NEVER skip Low Risk files or treat this as proof of safety.">?</button>
+            </span>
           </div>
           <div id="kpiStateLabel" class="stat-value">-</div>
-          <div id="kpiSignals" class="stat-foot mono" data-tip-title="Signal Counts" data-tip="state = mutable state writes · err = error/recovery paths · retry = retry/timeout/cancel · async = locks/await/concurrency · guard = added branch checks · rm-guard = removed branch checks.">-</div>
+          <div id="kpiSignals" class="stat-foot mono" data-tip-title="Signal Counts (Heuristic)" data-tip="state = state writes · err = error paths · retry = retry/timeout/cancel · async = locks/await · guard = added checks · rm-guard = removed checks (highest warning).">-</div>
         </div>
         <div class="panel stat-panel">
           <div class="stat-label">
             <span>Integrity &amp; Budget</span>
-            <button class="tip-btn" type="button" aria-label="Explain Integrity and Budget metric" aria-expanded="false" data-tip-title="Integrity &amp; Budget" data-tip="Shows whether the diff fits in a single LLM abridging pass (1 Run Ready) or splits into semantic partitions, plus the input SHA-256 digest and live columbo-state-v1 claims when inspecting local Git targets.">?</button>
+            <span class="stat-label-meta">
+              <span class="kind-tag exact" data-tip-title="Exact Fact" data-tip="Exact SHA-256 fingerprint and byte size of this diff. If 1 character changes, the hash changes.">EXACT</span>
+              <button class="tip-btn" type="button" aria-label="Explain Integrity and Budget metric" aria-expanded="false" data-tip-title="Integrity &amp; Budget (Exact Fact)" data-tip="Shows if the diff fits in 1 AI pass or needs multiple chunks, plus its exact SHA-256 hash and raw byte size. Saved review claims turn stale automatically when the hash changes.">?</button>
+            </span>
           </div>
           <div id="kpiEnvTitle" class="stat-value">-</div>
-          <div id="kpiEnvDetail" class="stat-foot mono" data-tip-title="Input Digest &amp; Size" data-tip="SHA-256 cache fingerprint and raw byte size for this diff.">-</div>
+          <div id="kpiEnvDetail" class="stat-foot mono" data-tip-title="Input Digest &amp; Size (Exact Fact)" data-tip="Exact SHA-256 fingerprint and byte size for this diff.">-</div>
         </div>
       </section>
 
       <section class="grid-2">
         <div class="panel">
           <div class="panel-head">
-            <h2 class="panel-title">Changed Files &amp; Behavioral Meat <button class="tip-btn" type="button" aria-label="Explain Changed Files and Behavioral Meat" aria-expanded="false" data-tip-title="Changed Files &amp; Behavioral Meat" data-tip="Ranked by churn. Stacked bar: Green = behavioral meat lines (m), Amber = exact moved lines, Slate = stripped imports. Parentheses (n) = combined noise. Click any row to inspect its patch.">?</button></h2>
+            <h2 class="panel-title">Changed Files &amp; Behavioral Meat <button class="tip-btn" type="button" aria-label="Explain Changed Files and Behavioral Meat" aria-expanded="false" data-tip-title="Changed Files &amp; Behavioral Meat" data-tip="Ranked by churn. Bar colors: Green = behavioral meat lines (m), Amber = byte-exact moved lines, Slate = stripped imports. Parentheses (n) = combined noise. Click any row to inspect its patch.">?</button></h2>
             <span id="filesCountSub" class="panel-sub mono">0 files · click row</span>
           </div>
           <div class="panel-body flush" style="overflow-x:auto;">
@@ -999,9 +1040,9 @@ const INDEX_HTML = `<!doctype html>
               <thead>
                 <tr>
                   <th>File</th>
-                  <th class="col-xray"><span class="th-inner">X-Ray <button class="tip-btn" type="button" aria-label="Explain X-Ray column" aria-expanded="false" data-tip-title="Meat vs. Noise X-Ray" data-tip="m = behavioral lines kept for human review; (n) = stripped import lines + symmetric relocated moves.">?</button></span></th>
-                  <th class="num col-delta"><span class="th-inner">+ / - <button class="tip-btn" type="button" aria-label="Explain Added and Deleted lines column" aria-expanded="false" data-tip-title="Raw Line Delta" data-tip="Total lines prefixed with + and - in this file before deterministic filtering.">?</button></span></th>
-                  <th class="col-risk"><span class="th-inner">Risk <button class="tip-btn" type="button" aria-label="Explain Risk column" aria-expanded="false" data-tip-title="Heuristic Triage Risk (Not Safety Proof)" data-tip="Regex triage only: high = removed branch guard or >=3 state/error/retry cues; medium = 1-2 cues, >=2 added guards, or >=2 async/lock cues; low = no control-flow cues matched. Low risk does NOT prove a file is bug-free.">?</button></span></th>
+                  <th class="col-xray"><span class="th-inner">X-Ray <button class="tip-btn" type="button" aria-label="Explain X-Ray column" aria-expanded="false" data-tip-title="Meat vs. Noise X-Ray (Exact Fact)" data-tip="m = behavioral meat lines to read; (n) = stripped imports + byte-exact moved lines.">?</button></span></th>
+                  <th class="num col-delta"><span class="th-inner">+ / - <button class="tip-btn" type="button" aria-label="Explain Added and Deleted lines column" aria-expanded="false" data-tip-title="Raw Line Delta (Exact Fact)" data-tip="Exact count of added (+) and deleted (-) lines in this file before filtering.">?</button></span></th>
+                  <th class="col-risk"><span class="th-inner">Risk <button class="tip-btn" type="button" aria-label="Explain Risk column" aria-expanded="false" data-tip-title="Risk Tier (Heuristic Guide — Not Safety Proof)" data-tip="Reading-order hint from regex patterns only: high = removed check or >=3 state/error/retry cues; medium = 1-2 cues or >=2 guards/locks; low = no control-flow patterns matched. Low risk does NOT prove the file is bug-free (can miss math, config, or argument-order bugs).">?</button></span></th>
                 </tr>
               </thead>
               <tbody id="overviewFilesBody"></tbody>
